@@ -14,8 +14,8 @@ error — into contributions of
 
 for every **old class or task** separately (what was forgotten). All contributions sum to the
 measured loss change, and every claim is checked against ground-truth interventions
-(removal-and-retrain, linear datamodeling score, class-targeted surgery, rollback,
-freeze-and-retrain).
+(removal-and-retrain, linear datamodeling score, class-targeted surgery, freeze-and-retrain,
+proxy curation of unseen runs). Adam is covered by an exact adjoint ledger.
 
 ## How it works (one SGD step)
 
@@ -63,17 +63,37 @@ resume automatically after a disconnect.
 
 ## Benchmarks and learners
 
-| config | scenario | model |
-|---|---|---|
-| `pm5_mlp.yaml` | Permuted-MNIST, 5 tasks, domain-IL | MLP 784-256-256 |
-| `sf2_mlp.yaml` | Split-FashionMNIST, 2 tasks, domain-IL | MLP |
-| `sm5_mlp.yaml` | Split-MNIST, 5 tasks, class-IL / task-IL | MLP |
-| `sc10_resnet.yaml` | Seq-CIFAR-10, 5 tasks, class-IL / task-IL | reduced ResNet-18 (GN or BN) |
-| `sc100_resnet.yaml` | Seq-CIFAR-100, 10 tasks, class-IL / task-IL | reduced ResNet-18 |
+Configurations used in the paper (all CPU, 10 seeds each):
+
+| config | scenario | model | role |
+|---|---|---|---|
+| `pm2_mlp.yaml` | Permuted MNIST, 2 tasks, domain-IL | MLP 784-100-100 | core benchmark (PM) |
+| `sf2_mlp.yaml` | Split Fashion-MNIST, 2 tasks, task-IL | MLP 784-256-256 | core benchmark (SF) |
+| `c10_cnn.yaml` | Split CIFAR-10, 2 tasks, task-IL | CNN 32-64-64 + fc128, no norm | core benchmark (C10) |
+| `ppm_dose.yaml` | Permuted MNIST with a fraction `perm_frac` of pixels permuted | MLP 784-100-100 | dose-response, Adam |
+| `sm3_mlp.yaml` | Split MNIST, 3 tasks, class-IL | MLP 784-256-256 | five continual learners |
+
+Further configurations for GPU runs: `pm5_mlp.yaml`, `sm5_mlp.yaml`, `sc10_resnet.yaml`,
+`sc100_resnet.yaml` (reduced ResNet-18 with GN or BN).
 
 Learners: `finetune`, `er`, `derpp`, `ewc` (online), `agem`. Replay uses a *bottom-k hash
 buffer* — distributionally a reservoir, but a sample's membership never depends on other
 samples, so counterfactual retraining after removals is clean.
+
+## Reproducing the paper
+
+`scripts/reproduce_paper.sh` lists every run behind the paper (core benchmarks, transfer targets,
+dose-response, Adam, continual learners, numerical ablations, proxy curation) and ends with
+
+```bash
+python -m flgr.analysis.paper --runs ./runs --fig ./paper/figures --tab ./paper/generated
+```
+
+which writes every figure (PDF), every table (LaTeX) and a macro file with every number quoted in the
+text, so that text and data cannot drift apart. Statistics (`flgr/analysis/stats.py`): BCa bootstrap
+intervals, exact sign-flip permutation tests with Holm correction within pre-specified families,
+paired t / Wilcoxon, Cohen's d_z, TOST equivalence, linear mixed-effects trends. On two CPU cores the
+whole study takes about 13 hours.
 
 ## Checkpoints and outputs
 
@@ -108,8 +128,9 @@ flgr/ledger.py        probe sets, adaptive quadrature, exact per-source / per-pa
 flgr/trainer.py       training loop, checkpoint / resume, snapshots, evaluation
 flgr/scores.py        baseline attributions (TracIn-CP, gradient similarity, loss, features, Fisher)
 flgr/experiments.py   commands: train, scores, removal, surgery, lds, params
-flgr/analysis/        aggregation, statistics, tables
+flgr/analysis/        statistics (stats.py), paper figures / tables / macros (paper.py), aggregation
 configs/              benchmark configs (YAML, CLI-overridable)
+scripts/              run.py (all commands), curation.py (proxy curation), reproduce_paper.sh
 notebooks/            Colab and Kaggle runners for the CIFAR experiments
 tests/                correctness tests
 pilot/                the original feasibility study

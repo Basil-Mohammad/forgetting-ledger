@@ -110,3 +110,16 @@ def test_hash_buffer_stable_under_removal():
         b2.add(k, 0)
     s1 = set(b1.gidx.tolist()) - set(removed.tolist())
     assert s1 <= set(b2.gidx.tolist())
+
+
+def test_adam_ledger_is_complete(tmp_path):
+    cfg = cfg_for("sm5_mlp.yaml", n_tasks=2)
+    cfg["train"].update(optimizer="adam", lr=0.002)
+    tr = setup(cfg, str(tmp_path), log=False)
+    tr.run()
+    led = torch.load(tmp_path / "ledger" / "task1.pt", weights_only=False)
+    rel = float((led["path_g"] - led["true_dL"]).abs().sum() / led["true_dL"].abs().sum())
+    assert rel < 0.05, rel
+    src = led["data"].sum(0) + led["reg"]                       # new samples + momentum carried over
+    assert torch.allclose(src, led["path_g"], rtol=1e-4, atol=1e-6), (src, led["path_g"])
+    assert led["reg"].abs().sum() > 0

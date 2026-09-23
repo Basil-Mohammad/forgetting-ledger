@@ -51,28 +51,33 @@ class ProbeSet:
         return F.cross_entropy(masked_logits(logits, self.mask), self.y, reduction="none")
 
 
-def _call(model, params: Optional[Dict[str, torch.Tensor]], x):
-    if params is None:
+def _call(model, params: Optional[Dict[str, torch.Tensor]], x, buffers: Optional[Dict[str, torch.Tensor]] = None):
+    if params is None and buffers is None:
         return model(x)
-    return functional_call(model, params, (x,))
+    if params is None:
+        params = {n: p for n, p in model.named_parameters()}
+    if buffers is None:
+        return functional_call(model, params, (x,))
+    return functional_call(model, (params, buffers), (x,))
 
 
-def probe_grads(model, probe: ProbeSet, flat_theta: Optional[torch.Tensor] = None, chunk: int = 0):
-    """Group losses [G] and group gradients [G, P] at theta (current params if flat_theta is None).
-    Always evaluated in eval mode (the model as it would be tested)."""
+def probe_grads(model, probe: ProbeSet, flat_theta: Optional[torch.Tensor] = None,
+                buffers: Optional[Dict[str, torch.Tensor]] = None):
+    """Group losses [G] and group gradients [G, P] at theta (current params if flat_theta is None)
+    and normalisation buffers (current if None). Always evaluated in eval mode (as at test time)."""
     was = model.training
     model.eval()
     names = [n for n, p in model.named_parameters() if p.requires_grad]
     plist = params_of(model)
     if flat_theta is None:
         leaves = plist
-        pdict = None
+        pdict = None if buffers is None else dict(zip(names, leaves))
     else:
         leaves, i = [], 0
         for p in plist:
             leaves.append(flat_theta[i:i + p.numel()].view_as(p).detach().requires_grad_(True)); i += p.numel()
         pdict = dict(zip(names, leaves))
-    ce = probe.losses(_call(model, pdict, probe.x))
+    ce = probe.losses(_call(model, pdict, probe.x, buffers))
     Lg = probe.W @ ce.detach()
     try:
         gs = torch.autograd.grad(ce, leaves, grad_outputs=probe.W, is_grads_batched=True)
@@ -124,6 +129,9 @@ class LedgerAccumulator:
         self.path_var = z(G)                   # sum_t |L_g(t+1) - L_g(t)|  (total variation of the path)
         self.step_err: List[float] = []
         self.early: Dict[str, torch.Tensor] = {}
+        self.data_euler = z(n_new, G)          # optional: per-sample Euler (idealised TracIn) attribution
+        self.sample_loss: List[torch.Tensor] = []   # per-epoch per-sample training loss (anatomy analysis)
+        self.sample_correct: List[torch.Tensor] = []
 
     def state_dict(self):
         return {k: v for k, v in self.__dict__.items() if k not in ("unit_meta",)}
@@ -134,7 +142,7 @@ class LedgerAccumulator:
 
 def path_average_gradient(model, probe: ProbeSet, theta: torch.Tensor, delta: torch.Tensor,
                           G0: torch.Tensor, G1: torch.Tensor, dL_exact: torch.Tensor, rule: str,
-                          tol: float = 1e-4, max_intervals: int = 8):
+                          tol: float = 1e-3, max_intervals: int = 8, buffers=None):
     """Average of the probe-group gradients along the segment theta -> theta + delta.
 
     ``adaptive`` uses composite Simpson quadrature and doubles the number of sub-intervals until
@@ -153,7 +161,7 @@ def path_average_gradient(model, probe: ProbeSet, theta: torch.Tensor, delta: to
         for k in range(n + 1):
             key = k * (max_intervals // n)
             if key not in nodes:
-                _, nodes[key] = probe_grads(model, probe, theta + (k / n) * delta)
+                _, nodes[key] = probe_grads(model, probe, theta + (k / n) * delta, buffers)
                 evals += 1
         w = torch.tensor([1.0] + [4.0 if k % 2 else 2.0 for k in range(1, n)] + [1.0], device=G0.device) / (3.0 * n)
         gbar = sum(w[k] * nodes[k * (max_intervals // n)] for k in range(n + 1))
@@ -168,19 +176,23 @@ def path_average_gradient(model, probe: ProbeSet, theta: torch.Tensor, delta: to
 def ledger_step(model, lr: float, terms: Terms, grads_graph: List[torch.Tensor], u: torch.Tensor,
                 proj: Optional[Projection], G_start: torch.Tensor, probe: ProbeSet, acc: LedgerAccumulator,
                 rule: str = "adaptive", frozen: Optional[torch.Tensor] = None, L_start: Optional[torch.Tensor] = None,
-                tol: float = 1e-4, max_intervals: int = 8):
+                tol: float = 1e-3, max_intervals: int = 8, also_euler: bool = False, shapley: Optional[dict] = None):
     """Perform the ledger bookkeeping for one step and return (Delta, L_end, G_end).
 
-    ``grads_graph`` are the parameter gradients of sum_i u_i l_i built with create_graph=True.
-    Parameters are NOT modified here (the caller applies Delta afterwards).
+    ``grads_graph`` are the parameter gradients of sum_i u_i l_i built with create_graph=True;
+    parameters are NOT modified here (the caller applies Delta afterwards).
+    ``G_start``/``L_start`` are evaluated at (theta_t, s_{t+1}).
+    ``shapley`` (models with running statistics): dict(buffers_old, G_old, L_old) at (theta_t, s_t);
+    the step is then decomposed symmetrically (Shapley average over the two orders of
+    'statistics first' and 'parameters first'), which removes the arbitrariness of the order.
+    ``also_euler``: additionally accumulate the per-sample Euler (left-point, idealised TracIn)
+    attribution in ``acc.data_euler`` for comparison.
     """
     gflat = flat(grads_graph)
     g = gflat.detach()
     d = g
-    coef = 0.0
     if proj is not None and proj.active:
-        coef = float(g @ proj.g_ref) / proj.ref_norm2
-        d = g - coef * proj.g_ref
+        d = g - (float(g @ proj.g_ref) / proj.ref_norm2) * proj.g_ref
     if frozen is not None:
         d = d * (~frozen)
     delta = -lr * d
@@ -189,6 +201,17 @@ def ledger_step(model, lr: float, terms: Terms, grads_graph: List[torch.Tensor],
     dL_exact = (L_end - L_start) if L_start is not None else torch.zeros_like(L_end)
     gbar, n_ev = path_average_gradient(model, probe, theta, delta, G_start, G_end, dL_exact, rule, tol, max_intervals)
     acc.n_evals += n_ev + 1
+    if shapley is not None:
+        # path at the old statistics, and the symmetric statistics term
+        L_end0, G_end0 = probe_grads(model, probe, theta + delta, shapley["buffers_old"])
+        dL0 = L_end0 - shapley["L_old"]
+        gbar0, n_ev0 = path_average_gradient(model, probe, theta, delta, shapley["G_old"], G_end0, dL0, rule, tol,
+                                             max_intervals, shapley["buffers_old"])
+        acc.n_evals += n_ev0 + 1
+        gbar = 0.5 * (gbar + gbar0)
+        acc.stats += (0.5 * ((L_start - shapley["L_old"]) + (L_end - L_end0))).double()
+    else:
+        pass                                                         # statistics-first term added by the caller
     acc.path_var += dL_exact.abs().double()
     # ---- parameter / unit / layer attribution
     pg = gbar * delta.unsqueeze(0)                                   # [G, P]
@@ -202,27 +225,36 @@ def ledger_step(model, lr: float, terms: Terms, grads_graph: List[torch.Tensor],
     acc.learn_param += lp.double()
     acc.learn_unit.index_add_(0, acc.unit_of, lp.double())
     # ---- per-term attribution via double backward
-    V = gbar if frozen is None else gbar * (~frozen).unsqueeze(0)
+    G = gbar.shape[0]
+    blocks = [gbar]
+    if also_euler:
+        blocks.append(G_start)
     extra = proj is not None and proj.active
+    V = torch.cat(blocks)
+    if frozen is not None:
+        V = V * (~frozen).unsqueeze(0)
     if extra:
         V = torch.cat([V, proj.g_ref.unsqueeze(0)])
-    h = V @ gflat                                                    # [G(+1)] scalars, differentiable in u
+    h = V @ gflat                                                    # scalars, differentiable in u
     eye = torch.eye(len(h), device=h.device)
     try:
-        D = torch.autograd.grad(h, u, grad_outputs=eye, is_grads_batched=True)[0]   # [G(+1), m]
+        D = torch.autograd.grad(h, u, grad_outputs=eye, is_grads_batched=True)[0]
     except RuntimeError:
         D = torch.stack([torch.autograd.grad(h[i], u, retain_graph=i < len(h) - 1)[0] for i in range(len(h))])
-    D = D.T                                                          # [m, G(+1)]
+    D = D.T                                                          # [m, rows]
     if extra:
-        gref_dot = (proj.g_ref.unsqueeze(0) * V[:-1]).sum(1) if frozen is None else (proj.g_ref * (~frozen)) @ V[:-1].T
-        contrib = -lr * (D[:, :-1] - D[:, -1:] * (gref_dot.view(1, -1) / proj.ref_norm2))
+        gref = proj.g_ref if frozen is None else proj.g_ref * (~frozen)
+        gref_dot = V[:-1] @ gref                                     # [rows-1]
+        contrib_all = -lr * (D[:, :-1] - D[:, -1:] * (gref_dot.view(1, -1) / proj.ref_norm2))
     else:
-        contrib = -lr * D
-    contrib = contrib.double()
+        contrib_all = -lr * D
+    contrib = contrib_all[:, :G].double()
     for kind, ids, sl in zip(terms.kinds, terms.ids, terms.slices):
         c = contrib[sl]
         if kind == "new":
             acc.data.index_add_(0, ids, c)
+            if also_euler:
+                acc.data_euler.index_add_(0, ids, contrib_all[sl, G:2 * G].double())
         elif kind == "mem":
             acc.mem.index_add_(0, ids, c)
         else:

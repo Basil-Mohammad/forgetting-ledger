@@ -160,4 +160,56 @@ table. Effect sizes (Cohen's d_z) are reported alongside p-values.
 
 ## Deviations
 
-*(none yet)*
+**2026-09-23 (before any main result was inspected).** Following external review of the pilot and a
+calibration study (forgetting magnitude only, no attribution results were looked at):
+
+1. *Seeds.* 10 seeds (was 5) for every core configuration; `data_seed` is fixed to 0, so seeds vary
+   initialisation, visiting order and augmentation while the data (split, permutation) stay the same.
+   This is required for the new cross-seed stability analysis (RQ9 below).
+2. *Benchmarks re-calibrated to a non-saturated forgetting regime.* With the originally planned
+   settings Permuted-MNIST forgot < 1 pp (nothing to explain) and domain-incremental Split-FMNIST forgot
+   > 50 pp (label conflict: any subset of new data erases the old head). New core benchmarks:
+   PM (2 tasks, MLP 784-100-100, task A 10 epochs, task B 3 epochs, lr 0.1; ~6 pp forgetting),
+   Split-FMNIST task-IL (MLP 784-256-256, A 10 epochs, B 5 epochs, lr 0.05; ~11 pp),
+   Split-CIFAR-10 task-IL (small CNN, A 20k images / 10 epochs, B 5k images / 3 epochs, lr 0.1; ~14 pp).
+   ResNet-18 / CIFAR-100 and language models move to the GPU notebooks (not part of this round).
+3. *Integration.* Adaptive composite Simpson (tolerance 1e-3, <= 8 sub-intervals) replaces the
+   trapezoidal rule as the default; completeness is additionally reported relative to the total
+   variation of the loss path (epsilon_TV), which stays meaningful when the net change is ~0.
+4. *Normalisation statistics.* The statistics channel is computed as the Shapley average of both
+   accounting orders (order-free), replacing the statistics-first order.
+5. *Baselines added.* TRAK-style projected influence (k = 512, 4 checkpoints) and the per-sample
+   Euler ledger (= idealised TracIn), computed alongside the ledger in the same run.
+6. *Parameter level.* Rollback is kept only as an off-trajectory negative control; freeze-and-retrain
+   is the primary parameter-level intervention.
+7. *New research questions.*
+   RQ9 (stability): is per-sample harm reproducible across seeds and architectures (MLP -> wide MLP, CNN)?
+   RQ10 (anatomy): which sample properties (learning speed, loss, margin, gradient norm, similarity to old
+   classes) predict harm?
+   RQ11 (dose-response): how do concentration, localisation and removal efficacy change with input overlap
+   between tasks (partial permutation fraction 0.25-1.0, 10 seeds per level; mixed-effects trend tests)?
+   RQ12 (Adam): exact adjoint ledger for Adam (10 seeds).
+8. *Statistics.* BCa bootstrap CIs (10 000 resamples); exact sign-flip permutation tests with
+   Holm-Bonferroni correction; paired t / Wilcoxon as robustness checks; Cohen's d_z with bootstrap CI;
+   TOST equivalence (margin 5 pp) for ledger vs TracIn-CP; linear mixed-effects models for trends.
+
+**2026-09-23, second entry (after the first PM/SF runs had finished; stated honestly).**
+
+9. *Intervention outcome.* Removal, surgery, freeze and curation retrainings are each repeated with
+   three visiting orders and averaged (last-iterate SGD at the chosen learning rates varies by several
+   points between visiting orders). The primary outcome is the forgetting prevented, ΔF_q, in absolute
+   old-task accuracy points; ρ_q = ΔF_q / F is reported but is unstable when F is small. The old-task
+   test loss is a secondary outcome. This was decided after observing the variance of the first PM runs
+   and before any method comparison was computed; all affected interventions were re-run.
+10. *Multiplicity families.* Holm correction within two pre-specified families (confirmatory:
+   trajectory-free scores; trajectory-based estimators), matching H2, instead of within whole tables.
+11. *TOST margin.* 1 accuracy point of ΔF (stricter than the 5 points of ρ_q stated above).
+12. *Exploratory additions (after inspecting PM/SF results, labelled as exploratory in the paper).*
+   (a) Pooled sign-flip test over all benchmark × seed units. (b) Reproducibility of the magnitude
+   |harm| and "double-edged" samples (top harmful in one seed, top protective in another).
+   (c) Proxy curation with two-fold cross-fitting over seeds and across architectures (5 target seeds
+   per architecture; proxies from seeds disjoint from the targets).
+13. *Cost.* Transfer runs with the CNN on PM/SF use the trapezoidal rule without the Euler companion
+   (their only use is the per-sample harm vector for the transfer correlation; adaptive Simpson on a
+   CPU made each run ~1 h). Rule ablations and learning-rate sweeps use 3 seeds (numerical checks, not
+   hypotheses about data).

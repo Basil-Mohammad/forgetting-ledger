@@ -1,0 +1,10 @@
+# Mechanisms of continual learners (RQ5): Split-MNIST, 3 tasks x 3 classes, class-incremental.
+base: _default.yaml
+benchmark: smnist
+setting: class
+n_tasks: 3
+data_seed: 0
+train_per_task: 3000
+model: {name: mlp, hidden: 256, depth: 2}
+train: {lr: 0.05, batch_size: 32, epochs: 3}
+learner: {buffer_size: 200, minibatch: 32}

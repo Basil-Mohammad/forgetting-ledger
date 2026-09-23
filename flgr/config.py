@@ -41,4 +41,5 @@ def deep_merge(a: dict, b: dict) -> dict:
 def run_name(cfg: dict) -> str:
     l = cfg.get("learner", {}).get("name", "finetune")
     norm = cfg["model"].get("norm")
-    return f"{cfg['benchmark']}-{cfg['setting']}-{cfg['model']['name']}{'-' + norm if norm else ''}-{l}-s{cfg['seed']}"
+    tag = f"-{cfg['tag']}" if cfg.get("tag") else ""
+    return f"{cfg['benchmark']}-{cfg['setting']}-{cfg['model']['name']}{'-' + norm if norm else ''}-{l}{tag}-s{cfg['seed']}"

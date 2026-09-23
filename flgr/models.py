@@ -77,10 +77,36 @@ class ResNet18Reduced(nn.Module):
         return self.head(self.features(x))
 
 
+class SmallCNN(nn.Module):
+    """Three conv blocks (32-64-64) + FC-128; ~0.2M parameters on CIFAR, ~0.1M on MNIST."""
+
+    def __init__(self, n_out: int, in_ch: int, size: int, width: int = 32, norm: str = "none"):
+        super().__init__()
+        c1, c2 = width, 2 * width
+        self.conv1, self.n1 = nn.Conv2d(in_ch, c1, 3, padding=1), _norm(norm, c1)
+        self.conv2, self.n2 = nn.Conv2d(c1, c2, 3, padding=1), _norm(norm, c2)
+        self.conv3, self.n3 = nn.Conv2d(c2, c2, 3, padding=1), _norm(norm, c2)
+        s = size // 2 // 2 // 2
+        self.fc = nn.Linear(c2 * s * s, 128)
+        self.head = nn.Linear(128, n_out)
+
+    def features(self, x):
+        x = F.max_pool2d(F.relu(self.n1(self.conv1(x))), 2)
+        x = F.max_pool2d(F.relu(self.n2(self.conv2(x))), 2)
+        x = F.max_pool2d(F.relu(self.n3(self.conv3(x))), 2)
+        return F.relu(self.fc(x.flatten(1)))
+
+    def forward(self, x):
+        return self.head(self.features(x))
+
+
 def build_model(cfg: dict, scenario) -> nn.Module:
     m = cfg["model"]
     if m["name"] == "mlp":
         return MLP(784, scenario.n_outputs, hidden=int(m.get("hidden", 256)), depth=int(m.get("depth", 2)))
+    if m["name"] == "cnn":
+        cifar = scenario.dataset.startswith("cifar")
+        return SmallCNN(scenario.n_outputs, 3 if cifar else 1, 32 if cifar else 28, int(m.get("width", 32)), m.get("norm", "none"))
     if m["name"] == "resnet18r":
         return ResNet18Reduced(scenario.n_outputs, nf=int(m.get("nf", 20)), norm=m.get("norm", "gn"))
     raise ValueError(m["name"])
@@ -91,22 +117,26 @@ def build_model(cfg: dict, scenario) -> nn.Module:
 def unit_index(model: nn.Module) -> Tuple[torch.Tensor, List[dict], torch.Tensor, List[str]]:
     """Map every trainable scalar parameter to a *unit* and a *layer*.
 
-    A unit is an output neuron (Linear) or an output channel (Conv / norm affine). Returns
-    (unit_of_param [P], unit_meta, layer_of_param [P], layer_names).
+    A unit is one output neuron of a Linear layer or one output channel of a Conv / norm layer;
+    the weight row and the bias entry of the same output share the unit. Returns
+    (unit_of_param [P], unit_meta [U], layer_of_param [P], layer_names [L]).
     """
     unit_of, layer_of, meta, lnames = [], [], [], []
-    u0 = 0
+    key_to_unit: Dict[Tuple[str, int], int] = {}
     for li, (name, p) in enumerate((n, p) for n, p in model.named_parameters() if p.requires_grad):
         lnames.append(name)
+        module = name.rsplit(".", 1)[0]
         n_units = p.shape[0]
         per = p.numel() // n_units
-        unit_of.append((torch.arange(n_units).repeat_interleave(per) + u0))
-        layer_of.append(torch.full((p.numel(),), li, dtype=torch.long))
-        # weights and biases / affine params of the same module share units
-        module = name.rsplit(".", 1)[0]
+        ids = []
         for j in range(n_units):
-            meta.append(dict(param=name, module=module, index=j))
-        u0 += n_units
+            k = (module, j)
+            if k not in key_to_unit:
+                key_to_unit[k] = len(meta)
+                meta.append(dict(module=module, index=j))
+            ids.append(key_to_unit[k])
+        unit_of.append(torch.tensor(ids, dtype=torch.long).repeat_interleave(per))
+        layer_of.append(torch.full((p.numel(),), li, dtype=torch.long))
     return torch.cat(unit_of), meta, torch.cat(layer_of), lnames
 
 

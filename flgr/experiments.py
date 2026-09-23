@@ -14,7 +14,8 @@ from .data import Scenario
 from .ledger import ProbeSet, probe_grads, probe_losses
 from .learners import build_learner
 from .models import build_model, merge_units_by_module, unit_index
-from .scores import (feature_class_similarity, feature_proximity, fisher_diag, grad_dot_scores, loss_scores)
+from .scores import (feature_class_similarity, feature_proximity, fisher_diag, grad_dot_scores, loss_scores,
+                     margin_scores, trak_harm)
 from .trainer import Trainer
 from .utils import (atomic_json, atomic_torch_save, env_info, flat_params, git_commit, hash_uniform, params_of,
                     pick_device, seed_everything, set_flat_params)
@@ -27,8 +28,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 def setup(cfg: dict, run_dir: str, track: bool = True, log: bool = True):
     seed_everything(int(cfg["seed"]))
     device = pick_device(cfg.get("device", "auto"))
-    if device.type == "cpu":
-        torch.set_num_threads(max(1, os.cpu_count() or 1))
+    if device.type == "cpu":                     # respect OMP_NUM_THREADS (parallel workers must not oversubscribe)
+        torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", 0)) or max(1, os.cpu_count() or 1))
     sc = Scenario(cfg, device)
     model = build_model(cfg, sc).to(device)
     learner = build_learner(cfg, sc, device)
@@ -92,25 +93,40 @@ def cmd_scores(cfg, run_dir):
         for k, v in led["early"].items():
             S[f"ledger_early{int(float(k) * 100)}"] = v.float()
         N, G = S["ledger"].shape
-        # --- checkpoint-based gradient scores (TracIn-CP family)
+        # --- checkpoint-based gradient scores (TracIn-CP family) and TRAK-style projected influence
         cps = led["cp_steps"]
         total = led["total_steps"]
         bounds = cps + [total]
-        per_cp = []
+        k_proj = int(cfg.get("scores", {}).get("trak_dim", 512))
+        trak_cps = set(np.linspace(0, len(cps) - 1, 4).round().astype(int).tolist())
+        P_ = sum(p.numel() for p in params_of(model))
+        gR = torch.Generator(device="cpu").manual_seed(1234 + int(cfg["seed"]))
+        R = (torch.randn(P_, k_proj, generator=gR) / np.sqrt(k_proj)).to(tr.device) if k_proj > 0 else None
+        per_cp, trak = [], torch.zeros(N, G, device=tr.device)
         for j in range(len(cps)):
             d = torch.load(tr.p("snapshots", f"task{t}_cp{j}.pt"), map_location=tr.device, weights_only=False)
             set_flat_params(model, d["theta"].to(tr.device))
             for k_, v in d["buffers"].items():
                 dict(model.named_buffers())[k_].copy_(v)
             _, Gm = probe_grads(model, probe)
-            dots, cos = grad_dot_scores(model, sc, t, Gm, want_cos=(j == 0))
+            use_R = R if j in trak_cps else None
+            dots, cos, norms, Psi = grad_dot_scores(model, sc, t, Gm, want_cos=(j == 0), R=use_R)
             per_cp.append(-tr.lr * dots * (bounds[j + 1] - bounds[j]) / N)
+            if Psi is not None:
+                trak += trak_harm(Psi, Gm @ R)
             if j == 0:
                 S["static_tracin"] = -dots
                 S["grad_cos"] = -cos
                 S["loss"] = loss_scores(model, sc, t).view(-1, 1).expand(-1, G).contiguous()
                 S["feature_prox"] = feature_proximity(model, sc, t, probe)
                 sim = feature_class_similarity(model, sc, t, probe)
+                feats = dict(loss_start=S["loss"][:, 0].clone(), margin_start=margin_scores(model, sc, t),
+                             gradnorm_start=norms, prox_start=S["feature_prox"].max(1).values)
+        if R is not None:
+            S["trak"] = trak / len(trak_cps)
+        del R
+        if led.get("data_euler") is not None and float(led["data_euler"].abs().sum()) > 0:
+            S["ledger_euler"] = led["data_euler"].float()
         pc = torch.stack(per_cp)                                                # [m, N, G]
         S["tracin_cp10"] = pc.sum(0)
         pick3 = sorted(set(np.linspace(0, len(cps) - 1, 3).round().astype(int).tolist()))
@@ -125,8 +141,17 @@ def cmd_scores(cfg, run_dir):
         # --- interference map: new class x old group
         ylab = sc.ytr[sc.tasks[t].train_idx]
         imap = torch.stack([S["ledger"][ylab == c].sum(0) for c in sc.tasks[t].classes])
+        # per-sample learning dynamics from the tracked run (anatomy of harmful samples)
+        if led.get("sample_correct"):
+            C = torch.stack(led["sample_correct"]).float()                     # [E, N]
+            first = torch.where(C.any(0), C.argmax(0).float(), torch.full((N,), float(len(C))))
+            feats["first_correct_epoch"] = first
+            feats["loss_end"] = led["sample_loss"][-1]
+            feats["label"] = sc.ytr[sc.tasks[t].train_idx].cpu()
         atomic_torch_save(dict(scores={k: v.cpu() for k, v in S.items()}, single=single, imap=imap.cpu(),
-                               feat_sim=sim.cpu(), new_classes=sc.tasks[t].classes, groups=led["groups"]), out_f)
+                               feat_sim=sim.cpu(), new_classes=sc.tasks[t].classes, groups=led["groups"],
+                               features={k: v.cpu() for k, v in feats.items()},
+                               train_idx=sc.tasks[t].train_idx.cpu()), out_f)
         print(f"[scores] task {t}: {len(S)} score types in {time.time() - t0:.0f}s", flush=True)
 
 
@@ -136,11 +161,16 @@ def _load_scores(tr, t):
 
 # ----------------------------------------------------------------------------- counterfactual retraining
 
-def retrain(tr: Trainer, t: int, keep: Optional[torch.Tensor] = None, frozen: Optional[torch.Tensor] = None) -> dict:
-    """Retrain task t from its saved start state (untracked) and evaluate."""
+def retrain(tr: Trainer, t: int, keep: Optional[torch.Tensor] = None, frozen: Optional[torch.Tensor] = None,
+            rep: int = 0) -> dict:
+    """Retrain task t from its saved start state (untracked) and evaluate. ``rep`` > 0 uses an
+    alternative visiting order (variance reduction by averaging over orders)."""
     tr.load_snapshot(f"task{t}_start")
-    tr.train_task(t, keep=keep, frozen=frozen, track=False, save=False)
-    return measure(tr, t)
+    tr.train_task(t, keep=keep, frozen=frozen, track=False, save=False, order_rep=rep)
+    out = measure(tr, t)
+    out["time_s"] = tr.last_train_time
+    out["steps"] = tr.last_train_steps
+    return out
 
 
 def measure(tr: Trainer, t: int) -> dict:
@@ -149,7 +179,31 @@ def measure(tr: Trainer, t: int) -> dict:
     L = probe_losses(tr.model, probe)
     old = [g for g in ev["groups"] if g["task"] < t]
     return dict(task_acc=ev["task_acc"], new_acc=ev["task_acc"][t], old_acc=float(np.mean(ev["task_acc"][:t])),
-                group_acc=[g["acc"] for g in old], probe_L=L.tolist())
+                group_acc=[g["acc"] for g in old], probe_L=L.tolist(), group_test_loss=[g["loss"] for g in old],
+                old_test_loss=float(np.mean([g["loss"] for g in old])))
+
+
+AVG_KEYS = ("new_acc", "old_acc", "old_test_loss")
+
+
+def retrain_avg(tr: Trainer, t: int, prev: Optional[dict], n_rep: int, keep=None, frozen=None) -> dict:
+    """Average of ``n_rep`` retrainings with different visiting orders (rep 0 = the original order).
+    ``prev`` (an earlier single result or average) is reused and extended."""
+    reps = list(prev.get("reps", [prev])) if prev else []
+    for r in range(len(reps), n_rep):
+        reps.append(retrain(tr, t, keep=keep, frozen=frozen, rep=r))
+    out = dict(reps=reps)
+    for k in ("task_acc", "group_acc", "probe_L", "group_test_loss"):
+        if all(k in x for x in reps):
+            out[k] = np.mean([x[k] for x in reps], 0).tolist()
+    for k in AVG_KEYS + ("time_s", "steps"):
+        if all(k in x for x in reps):
+            out[k] = float(np.mean([x[k] for x in reps]))
+    return out
+
+
+def _needs(R: dict, key: str, n_rep: int) -> bool:
+    return key not in R or len(R[key].get("reps", [R[key]])) < n_rep
 
 
 def _ref_acc(tr: Trainer, t: int) -> List[float]:
@@ -165,8 +219,8 @@ def _topk_keep(score: torch.Tensor, frac: float) -> torch.Tensor:
     return keep
 
 
-REMOVAL_METHODS = ["ledger", "tracin_cp3", "tracin_cp10", "static_tracin", "grad_cos", "loss", "feature_prox",
-                   "ledger_early10", "ledger_early20", "ledger_early50", "random"]
+REMOVAL_METHODS = ["ledger", "ledger_euler", "trak", "tracin_cp3", "tracin_cp10", "static_tracin", "grad_cos", "loss",
+                   "feature_prox", "ledger_early10", "ledger_early20", "ledger_early50", "random"]
 
 
 def cmd_removal(cfg, run_dir):
@@ -176,17 +230,19 @@ def cmd_removal(cfg, run_dir):
         S = _load_scores(tr, t)["scores"]
         R = _results(tr, f"removal_task{t}")
         R.setdefault("ref_acc", _ref_acc(tr, t))
-        if "none" not in R:
-            R["none"] = retrain(tr, t); _save_results(tr, f"removal_task{t}", R)
-        methods = [m for m in REMOVAL_METHODS if m in S] + ["ledger_helpful"]
+        n_rep = int(cfg["interventions"].get("reps", 3))
+        if _needs(R, "none", n_rep):
+            R["none"] = retrain_avg(tr, t, R.get("none"), n_rep); _save_results(tr, f"removal_task{t}", R)
+        wanted = cfg["interventions"].get("removal_methods") or REMOVAL_METHODS
+        methods = [m for m in wanted if m in S] + ["ledger_helpful"]
         for m in methods:
             s = -S["ledger"].sum(1) if m == "ledger_helpful" else S[m].sum(1)
             for q in cfg["interventions"]["removal_fracs"]:
                 key = f"{m}@{q}"
-                if key in R:
+                if not _needs(R, key, n_rep):
                     continue
                 t0 = time.time()
-                R[key] = retrain(tr, t, keep=_topk_keep(s.to(tr.device), q))
+                R[key] = retrain_avg(tr, t, R.get(key), n_rep, keep=_topk_keep(s.to(tr.device), q))
                 _save_results(tr, f"removal_task{t}", R)
                 print(f"[removal] task {t} {key}: old {R[key]['old_acc']:.4f} new {R[key]['new_acc']:.4f} ({time.time() - t0:.0f}s)", flush=True)
 
@@ -200,8 +256,9 @@ def cmd_surgery(cfg, run_dir):
         S = sc_["scores"]
         led = _load_ledger(tr, t)
         R = _results(tr, f"surgery_task{t}")
-        if "none" not in R:
-            R["none"] = retrain(tr, t); _save_results(tr, f"surgery_task{t}", R)
+        n_rep = int(ic.get("reps", 3))
+        if _needs(R, "none", n_rep):
+            R["none"] = retrain_avg(tr, t, R.get("none"), n_rep); _save_results(tr, f"surgery_task{t}", R)
         base_acc = np.array(R["none"]["group_acc"])
         # targets: most-forgotten groups that are not already at zero accuracy
         order = torch.argsort(led["true_dL"], descending=True).tolist()
@@ -213,9 +270,9 @@ def cmd_surgery(cfg, run_dir):
                    "static_target": S["static_tracin"][:, g], "ledger_total": S["ledger"].sum(1), "random": S["random"][:, 0]}
             for m, s in sel.items():
                 key = f"g{g}:{m}"
-                if key in R:
+                if not _needs(R, key, n_rep):
                     continue
-                R[key] = retrain(tr, t, keep=_topk_keep(s.to(tr.device), q))
+                R[key] = retrain_avg(tr, t, R.get(key), n_rep, keep=_topk_keep(s.to(tr.device), q))
                 _save_results(tr, f"surgery_task{t}", R)
                 gain = np.array(R[key]["group_acc"]) - base_acc
                 print(f"[surgery] task {t} g{g} {m}: target {gain[g]:+.3f} others {np.delete(gain, g).mean():+.3f}", flush=True)
@@ -264,6 +321,9 @@ def cmd_params(cfg, run_dir):
              "abs_delta": dth.abs().double(), "fisher_delta2": (F0 * dth ** 2).double(),
              "taylor_end": (G1.sum(0) * dth).double(),
              "random": hash_uniform(int(cfg["seed"]), 99, t, 0, torch.arange(len(dth), device=tr.device)).squeeze(1).double()}
+        keep_scores = ic.get("param_scores")
+        if keep_scores:
+            P = {k: v for k, v in P.items() if k in keep_scores}
         unit_of, meta, layer_of, lnames = unit_index(model)
         unit_of = unit_of.to(tr.device)
         U = int(unit_of.max()) + 1
@@ -280,8 +340,8 @@ def cmd_params(cfg, run_dir):
                 model.load_state_dict(end_state); set_flat_params(model, th)
                 lr_[n] = measure(tr, t)["old_acc"]
             R["layer_rollback"] = lr_
-        # parameter- and unit-level rollback --------------------------------------
-        for name, s in P.items():
+        # parameter- and unit-level rollback (off-trajectory negative control) -----
+        for name, s in (P.items() if ic.get("rollback", True) else []):
             us = _unit_scores(s, unit_of, U)
             for f in ic["param_fracs"]:
                 for level in ("param", "unit"):
@@ -303,15 +363,16 @@ def cmd_params(cfg, run_dir):
             us = _unit_scores(s, unit_of, U)
             for f in ic["param_fracs"]:
                 key = f"freeze:unit:{name}@{f}"
-                if key in R:
+                n_rep = int(ic.get("reps", 3))
+                if not _needs(R, key, n_rep):
                     continue
                 top = torch.argsort(us, descending=True)[: max(1, int(f * U))]
                 frozen = torch.isin(unit_of, top)
-                R[key] = retrain(tr, t, frozen=frozen)
+                R[key] = retrain_avg(tr, t, R.get(key), n_rep, frozen=frozen)
                 _save_results(tr, f"params_task{t}", R)
                 print(f"[params] task {t} {key}: old {R[key]['old_acc']:.4f} new {R[key]['new_acc']:.4f}", flush=True)
-        if "freeze:none" not in R:
-            R["freeze:none"] = retrain(tr, t)
+        if _needs(R, "freeze:none", int(ic.get("reps", 3))):
+            R["freeze:none"] = retrain_avg(tr, t, R.get("freeze:none"), int(ic.get("reps", 3)))
             _save_results(tr, f"params_task{t}", R)
 
 

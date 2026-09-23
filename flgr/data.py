@@ -57,7 +57,22 @@ def _load_idx_dataset(name: str, root: str):
             torch.from_numpy(xte.copy()).unsqueeze(1), torch.from_numpy(yte.astype(np.int64)))
 
 
+def _load_cifar_batches(d: str):
+    import pickle
+    def rd(f):
+        with open(os.path.join(d, f), "rb") as fh:
+            b = pickle.load(fh, encoding="bytes")
+        return (torch.from_numpy(np.asarray(b[b"data"], dtype=np.uint8).reshape(-1, 3, 32, 32)),
+                torch.tensor(b[b"labels"], dtype=torch.int64))
+    parts = [rd(f"data_batch_{i}") for i in range(1, 6)]
+    xte, yte = rd("test_batch")
+    return torch.cat([p[0] for p in parts]), torch.cat([p[1] for p in parts]), xte, yte
+
+
 def _load_cifar(name: str, root: str):
+    local = os.path.join(root, name, "cifar-10-batches-py")
+    if name == "cifar10" and os.path.exists(os.path.join(local, "data_batch_1")):
+        return _load_cifar_batches(local)
     import torchvision  # imported lazily: not needed for the MNIST family
     cls = torchvision.datasets.CIFAR10 if name == "cifar10" else torchvision.datasets.CIFAR100
     tr, te = cls(root, train=True, download=True), cls(root, train=False, download=True)
@@ -111,7 +126,8 @@ class Scenario:
         self.cfg = cfg
         self.device = device
         self.name = cfg["benchmark"]
-        self.seed = int(cfg["seed"])
+        self.seed = int(cfg["seed"])                         # init, visiting order, augmentation, buffer
+        self.data_seed = int(cfg.get("data_seed", cfg["seed"]))
         self.setting = cfg["setting"]
         root = cfg.get("data_root", "./data")
         ds = {"pmnist": "mnist", "smnist": "mnist", "sfmnist": "fashion",
@@ -131,7 +147,8 @@ class Scenario:
 
     # ------------------------------------------------------------------ construction
     def _build_tasks(self):
-        cfg, s = self.cfg, self.seed
+        cfg = self.cfg
+        s = self.data_seed                                   # data split / permutations: data_seed
         n_classes = int(self.ytr.max().item()) + 1
         n_probe = int(cfg.get("probe_per_class", 20))
         n_train_cap = cfg.get("train_per_task")          # optional cap on training samples per task
@@ -140,13 +157,14 @@ class Scenario:
         if self.name == "pmnist":                       # every task: all 10 digits, own pixel permutation
             self.classes_per_task = 10
             for t in range(self.n_tasks):
-                perm = torch.arange(784) if t == 0 else fixed_permutation(784, s, STREAM_PERM, t)
+                perm = torch.arange(784) if t == 0 else self._partial_perm(float(cfg.get("perm_frac", 1.0)), s, t)
                 self.perms[t] = perm.to(self.device)
                 order = fixed_permutation(len(self.ytr), s, STREAM_SPLIT, t).to(self.device)
                 probe = torch.cat([order[self.ytr[order] == c][:n_probe] for c in range(10)])
                 rest = order[~torch.isin(order, probe)]
-                if n_train_cap:
-                    rest = rest[: int(n_train_cap)]
+                cap = cfg.get("first_task_train") if t == 0 and cfg.get("first_task_train") else n_train_cap
+                if cap:
+                    rest = rest[: int(cap)]
                 self.tasks.append(Task(t, list(range(10)), rest, probe, torch.arange(len(self.yte), device=self.device)))
         else:
             cpt = n_classes // self.n_tasks
@@ -164,11 +182,23 @@ class Scenario:
                     tr.append(idx[n_probe:])
                 tr = torch.cat(tr)
                 tr = tr[fixed_permutation(len(tr), s, STREAM_SPLIT, t, 12345).to(self.device)]
-                if n_train_cap:
-                    tr = tr[: int(n_train_cap)]
+                cap = cfg.get("first_task_train") if t == 0 and cfg.get("first_task_train") else n_train_cap
+                if cap:
+                    tr = tr[: int(cap)]
                 te = torch.nonzero(torch.isin(self.yte, torch.tensor(cls, device=self.device))).squeeze(1)
                 self.tasks.append(Task(t, cls, tr, torch.cat(pr), te, [self.class_names[c] for c in cls]))
         self.n_outputs = self.classes_per_task if self.setting == "domain" else n_classes
+
+    @staticmethod
+    def _partial_perm(frac: float, s: int, t: int) -> torch.Tensor:
+        """Permutation that shuffles a random fraction ``frac`` of the 784 pixel positions among
+        themselves (frac=1: full permutation; frac->0: identity). Controls input-space task overlap."""
+        perm = torch.arange(784)
+        k = int(round(frac * 784))
+        if k >= 2:
+            pos = fixed_permutation(784, s, STREAM_PERM, t, 1)[:k]
+            perm[pos] = pos[fixed_permutation(k, s, STREAM_PERM, t, 2)]
+        return perm
 
     # ------------------------------------------------------------------ inputs / targets
     def inputs(self, x_uint8: torch.Tensor, task: int, idx: Optional[torch.Tensor] = None,
@@ -181,6 +211,9 @@ class Scenario:
             x = x.reshape(len(x), -1)
             if task in self.perms:
                 x = x[:, self.perms[task]]
+        elif task in self.perms:
+            n, c, h, w = x.shape
+            x = x.reshape(n, -1)[:, self.perms[task]].reshape(n, c, h, w)
         return x
 
     def _augment(self, x, task, epoch, idx):

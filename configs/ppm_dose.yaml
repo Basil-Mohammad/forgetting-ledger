@@ -1,0 +1,15 @@
+# Dose-response: Permuted-MNIST with a partial permutation of a fraction perm_frac of pixels.
+# perm_frac controls input-space overlap between the tasks (small = similar tasks).
+base: pm2_mlp.yaml
+perm_frac: 0.5
+train_per_task: 5000
+ledger: {tracin_checkpoints: 4, also_euler: false}
+scores: {trak_dim: 0}
+interventions:
+  removal_fracs: [0.1]
+  removal_methods: [ledger, tracin_cp3, static_tracin, random]
+  lds_subsets: 0
+  param_fracs: [0.02, 0.1]
+  param_scores: [ledger, ledger_net, fisher_delta2, random]
+  rollback: false
+  surgery_targets: 0

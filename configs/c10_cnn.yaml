@@ -1,0 +1,21 @@
+# Core benchmark 3: Split-CIFAR-10, 2 tasks (classes 0-4 then 5-9), task-incremental, small CNN.
+base: _default.yaml
+benchmark: scifar10
+setting: task
+n_tasks: 2
+data_seed: 0
+train_per_task: 5000
+first_task_train: 20000
+augment: true
+model: {name: cnn, width: 32, norm: none}
+train: {lr: 0.1, batch_size: 32, epochs: 3, first_task_epochs: 10}
+ledger: {tracin_checkpoints: 5}
+interventions:
+  tasks: [1]
+  removal_fracs: [0.1, 0.2]
+  removal_methods: [ledger, ledger_euler, trak, tracin_cp3, static_tracin, random]
+  lds_subsets: 0
+  param_fracs: [0.1]
+  param_scores: [ledger, fisher_delta2, random]
+  rollback: false
+  surgery_targets: 1

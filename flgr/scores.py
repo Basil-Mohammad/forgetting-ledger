@@ -44,20 +44,50 @@ def _task_inputs(sc, t: int, epoch: int = 0):
     return x, y, sc.logit_mask(t, st, n=len(y))
 
 
-def grad_dot_scores(model, sc, t: int, Gm: torch.Tensor, chunk: int = 64, want_cos: bool = False):
-    """For every training sample i of task t: s[i,g] = grad l_i . G_g (and cosine if requested)."""
+def grad_dot_scores(model, sc, t: int, Gm: torch.Tensor, chunk: int = 64, want_cos: bool = False,
+                    R: Optional[torch.Tensor] = None):
+    """For every training sample i of task t: s[i,g] = grad l_i . G_g, optionally the cosine,
+    the per-sample gradient norm and a random projection R^T grad l_i (TRAK features)."""
     x, y, mask = _task_inputs(sc, t)
-    dots, coss, norms = [], [], []
+    dots, coss, norms, projs = [], [], [], []
     gn = Gm.norm(dim=1).clamp_min(1e-12)
     for i in range(0, len(x), chunk):
         sl = slice(i, i + chunk)
         g = per_sample_grads(model, x[sl], y[sl], mask[sl] if mask is not None else None, chunk)
         d = g @ Gm.T
         dots.append(d)
+        n = g.norm(dim=1)
+        norms.append(n)
         if want_cos:
-            n = g.norm(dim=1).clamp_min(1e-12)
-            coss.append(d / (n.view(-1, 1) * gn.view(1, -1)))
-    return torch.cat(dots), (torch.cat(coss) if want_cos else None)
+            coss.append(d / (n.clamp_min(1e-12).view(-1, 1) * gn.view(1, -1)))
+        if R is not None:
+            projs.append(g @ R)
+    return (torch.cat(dots), torch.cat(coss) if want_cos else None, torch.cat(norms),
+            torch.cat(projs) if R is not None else None)
+
+
+def trak_harm(Psi: torch.Tensor, phi: torch.Tensor, lam_rel: float = 1e-3) -> torch.Tensor:
+    """Projected-influence harm of each training sample on each probe group (one checkpoint).
+
+    Influence of up-weighting sample i on L_g is -grad L_g^T H^-1 grad l_i (Koh & Liang); TRAK
+    replaces H by the projected empirical-Fisher kernel Psi^T Psi. Harm = L_g increase caused by
+    including i = -phi_g^T (Psi^T Psi + lam I)^-1 psi_i.   Psi [N,k], phi [G,k] -> [N,G]."""
+    K = Psi.T @ Psi
+    lam = lam_rel * torch.trace(K) / K.shape[0]
+    Kinv_phi = torch.linalg.solve(K + lam * torch.eye(K.shape[0], dtype=K.dtype), phi.T)   # [k,G]
+    return -(Psi @ Kinv_phi)
+
+
+@torch.no_grad()
+def margin_scores(model, sc, t: int) -> torch.Tensor:
+    """Correct-class logit minus the largest other logit, at the current parameters."""
+    model.eval()
+    x, y, mask = _task_inputs(sc, t)
+    out = torch.cat([model(x[i:i + 1000]) for i in range(0, len(x), 1000)])
+    out = masked_logits(out, mask)
+    corr = out.gather(1, y.view(-1, 1)).squeeze(1)
+    other = out.scatter(1, y.view(-1, 1), -1e9).max(1).values
+    return corr - other
 
 
 @torch.no_grad()

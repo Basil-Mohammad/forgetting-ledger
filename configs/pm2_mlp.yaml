@@ -1,16 +1,16 @@
-# Core benchmark 2: Split-FashionMNIST, 2 tasks (classes 0-4 then 5-9), task-incremental (separate heads).
+# Core benchmark 1: Permuted-MNIST, 2 tasks (A: identity, B: full pixel permutation), domain-IL.
 base: _default.yaml
-benchmark: sfmnist
-setting: task
+benchmark: pmnist
+setting: domain
 n_tasks: 2
 data_seed: 0            # data split and permutation fixed across seeds (seed = init, order)
 train_per_task: 10000
-
-model: {name: mlp, hidden: 256, depth: 2}
-train: {lr: 0.05, batch_size: 32, epochs: 5, first_task_epochs: 10}
+perm_frac: 1.0
+model: {name: mlp, hidden: 100, depth: 2}
+train: {lr: 0.1, batch_size: 32, epochs: 3, first_task_epochs: 10}
 interventions:
   tasks: [1]
-  removal_fracs: [0.05, 0.1, 0.2]
+  removal_fracs: [0.01, 0.05, 0.1, 0.2]
   lds_subsets: 16
   param_fracs: [0.02, 0.1]
   param_scores: [ledger, ledger_net, fisher_delta2, abs_delta, random]
