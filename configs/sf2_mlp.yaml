@@ -1,0 +1,6 @@
+base: _default.yaml
+benchmark: sfmnist
+setting: domain
+n_tasks: 2
+train_per_task: 10000
+model: {name: mlp, hidden: 256, depth: 2}

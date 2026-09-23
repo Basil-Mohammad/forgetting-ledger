@@ -1,0 +1,5 @@
+base: _default.yaml
+benchmark: smnist
+setting: class           # override setting=task for task-IL
+n_tasks: 5
+model: {name: mlp, hidden: 256, depth: 2}

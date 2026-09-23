@@ -1,0 +1,10 @@
+base: _default.yaml
+benchmark: scifar10
+setting: class           # class | task
+n_tasks: 5
+augment: true
+train: {lr: 0.03, batch_size: 32, epochs: 10}
+model: {name: resnet18r, nf: 20, norm: gn}   # norm=bn for the BatchNorm ablation
+learner: {lambda: 10.0}
+interventions:
+  lds_subsets: 16

@@ -1,0 +1,38 @@
+# Defaults shared by all benchmarks (override in a benchmark file or on the command line).
+seed: 0
+device: auto
+data_root: ./data
+out_root: ./runs
+ckpt_every: 200          # steps between resumable checkpoints (state/latest.pt)
+probe_per_class: 20      # held-out probe images per class (never trained on)
+train:
+  lr: 0.05
+  batch_size: 32
+  epochs: 3
+  momentum: 0.0          # exact per-sample ledger requires plain SGD
+learner:
+  name: finetune         # finetune | er | derpp | ewc | agem
+  buffer_size: 500
+  minibatch: 32
+  alpha: 0.1             # DER++
+  beta: 0.5              # DER++
+  lambda: 100.0          # EWC
+  gamma: 1.0             # online EWC decay
+  fisher_samples: 200
+  ref_batch: 64          # A-GEM
+ledger:
+  rule: adaptive         # euler | trapezoid | simpson | adaptive (composite Simpson, refined until exact)
+  tol: 1.0e-3            # adaptive: per-step, per-group tolerance (abs + rel)
+  max_intervals: 8       # adaptive: max sub-intervals per step (power of two)
+  group_by: class        # class | task
+  tracin_checkpoints: 10
+  early_fractions: [0.1, 0.2, 0.5]
+  store_param_groups: false
+interventions:
+  tasks: [1, -1]                         # tasks to run counterfactuals on (-1 = last)
+  removal_fracs: [0.01, 0.05, 0.1, 0.2]
+  lds_subsets: 32
+  lds_frac: 0.5
+  param_fracs: [0.005, 0.01, 0.02, 0.05, 0.1]
+  surgery_targets: 3
+  surgery_frac: 0.1

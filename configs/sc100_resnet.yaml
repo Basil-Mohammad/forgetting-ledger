@@ -1,0 +1,12 @@
+base: _default.yaml
+benchmark: scifar100
+setting: class
+n_tasks: 10
+augment: true
+train: {lr: 0.03, batch_size: 32, epochs: 10}
+model: {name: resnet18r, nf: 20, norm: gn}
+learner: {lambda: 10.0, buffer_size: 2000}
+ledger: {group_by: task}
+interventions:
+  tasks: [1, 5, -1]
+  lds_subsets: 16
