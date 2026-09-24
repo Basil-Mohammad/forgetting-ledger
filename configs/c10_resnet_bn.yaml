@@ -1,0 +1,24 @@
+# GPU benchmark: Split-CIFAR-10, 2 tasks (classes 0-4 then 5-9), task-incremental,
+# reduced ResNet-18 (nf=20, ~1.1M parameters) with BatchNorm -> exercises the Shapley statistics
+# channel at scale. Same data protocol as c10_cnn.yaml (task A: 20k images, task B: 5k images).
+base: _default.yaml
+benchmark: scifar10
+setting: task
+n_tasks: 2
+data_seed: 0
+train_per_task: 5000
+first_task_train: 20000
+augment: true
+model: {name: resnet18r, nf: 20, norm: bn}
+train: {lr: 0.05, batch_size: 32, epochs: 3, first_task_epochs: 15}
+ledger: {tracin_checkpoints: 10, max_intervals: 16}
+interventions:
+  tasks: [1]
+  reps: 3
+  removal_fracs: [0.1, 0.2]
+  removal_methods: [ledger, ledger_euler, trak, tracin_cp10, tracin_cp3, static_tracin, grad_cos, loss, feature_prox, ledger_early20, random]
+  lds_subsets: 16
+  param_fracs: [0.02, 0.1]
+  param_scores: [ledger, fisher_delta2, abs_delta, random]
+  rollback: false
+  surgery_targets: 3

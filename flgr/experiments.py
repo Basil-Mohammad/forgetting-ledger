@@ -144,7 +144,7 @@ def cmd_scores(cfg, run_dir):
         # per-sample learning dynamics from the tracked run (anatomy of harmful samples)
         if led.get("sample_correct"):
             C = torch.stack(led["sample_correct"]).float()                     # [E, N]
-            first = torch.where(C.any(0), C.argmax(0).float(), torch.full((N,), float(len(C))))
+            first = torch.where(C.any(0), C.argmax(0).float(), torch.full((N,), float(len(C)), device=C.device))
             feats["first_correct_epoch"] = first
             feats["loss_end"] = led["sample_loss"][-1]
             feats["label"] = sc.ytr[sc.tasks[t].train_idx].cpu()

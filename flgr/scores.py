@@ -74,7 +74,7 @@ def trak_harm(Psi: torch.Tensor, phi: torch.Tensor, lam_rel: float = 1e-3) -> to
     including i = -phi_g^T (Psi^T Psi + lam I)^-1 psi_i.   Psi [N,k], phi [G,k] -> [N,G]."""
     K = Psi.T @ Psi
     lam = lam_rel * torch.trace(K) / K.shape[0]
-    Kinv_phi = torch.linalg.solve(K + lam * torch.eye(K.shape[0], dtype=K.dtype), phi.T)   # [k,G]
+    Kinv_phi = torch.linalg.solve(K + lam * torch.eye(K.shape[0], dtype=K.dtype, device=K.device), phi.T)   # [k,G]
     return -(Psi @ Kinv_phi)
 
 

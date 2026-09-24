@@ -213,3 +213,12 @@ calibration study (forgetting magnitude only, no attribution results were looked
    (their only use is the per-sample harm vector for the transfer correlation; adaptive Simpson on a
    CPU made each run ~1 h). Rule ablations and learning-rate sweeps use 3 seeds (numerical checks, not
    hypotheses about data).
+
+**2026-09-24 (planned before any ResNet result exists).** GPU extension: reduced ResNet-18 (nf = 20,
+BatchNorm) on the 2-task Split CIFAR-10 protocol of `c10_cnn.yaml` (`configs/c10_resnet_bn.yaml`), ten
+seeds. Purpose: scale (~1.1 M parameters) and an empirical test of the Shapley statistics channel.
+Differences to C10-CNN: lr 0.05, task A 15 epochs, adaptive quadrature with up to 16 sub-intervals,
+the full set of removal baselines (incl. TracIn-CP 10, gradient cosine, loss, feature proximity, early
+ledger), LDS with 16 subsets and three surgery targets. Hypotheses as for the core benchmarks (H1-H3, H9,
+H10); additionally H13: the statistics channel is non-negligible (> 5 % of |ΔL|) under BatchNorm and
+the ledger remains complete (ε < 5 %).

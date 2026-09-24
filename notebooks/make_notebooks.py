@@ -4,20 +4,10 @@ import nbformat as nbf
 REPO = "Basil-Mohammad/forgetting-ledger"
 
 JOBS = '''# One line per job: <command> <config> [overrides...]
-# `all` = train -> scores -> removal -> surgery -> lds -> params (each step resumable).
-JOBS = """
-all configs/sc10_resnet.yaml seed=0
-all configs/sc10_resnet.yaml seed=1
-all configs/sc10_resnet.yaml seed=2
-all configs/sc10_resnet.yaml seed=3
-all configs/sc10_resnet.yaml seed=4
-train configs/sc10_resnet.yaml seed=0 learner.name=er
-train configs/sc10_resnet.yaml seed=0 learner.name=derpp
-train configs/sc10_resnet.yaml seed=0 learner.name=ewc
-train configs/sc10_resnet.yaml seed=0 learner.name=agem
-train configs/sc10_resnet.yaml seed=0 model.norm=bn
-all configs/sc10_resnet.yaml seed=0 setting=task
-"""
+# `all` = train -> scores -> removal -> surgery -> lds -> params (every step resumable).
+# Phase 1 (paper, Section "Scale and batch normalisation"): reduced ResNet-18 with BatchNorm on
+# Split CIFAR-10, ten seeds. About 1 h per seed on a T4.
+JOBS = "\\n".join(f"all configs/c10_resnet_bn.yaml seed={s}" for s in range(10))
 JOBS = [l.split() for l in JOBS.strip().splitlines() if l.strip() and not l.startswith("#")]
 print(len(JOBS), "jobs")'''
 
@@ -39,36 +29,51 @@ for job in JOBS:
     if run_job(job) != 0:
         print("job failed - fix and re-run this cell (it will resume)"); break'''
 
-SMOKE = '''# Smoke test + timing on this GPU (about 1-2 minutes). Run once before the real jobs.
-import subprocess, sys
-subprocess.run([sys.executable, "scripts/run.py", "train", "configs/sc10_resnet.yaml", "seed=99", "n_tasks=2",
-                "train_per_task=640", "train.epochs=1", f"out_root={RUN_ROOT}/_smoke", f"data_root={DATA_ROOT}"],
-               cwd=REPO_DIR, check=True)'''
-
-AGG = '''import subprocess, sys
-subprocess.run([sys.executable, "-m", "flgr.analysis.aggregate", "--runs", RUN_ROOT, "--out", f"{RUN_ROOT}/../results"],
+SMOKE = '''# Smoke test on this GPU (about 5 minutes). Run once before the real jobs.
+import subprocess, sys, time
+t0 = time.time()
+# the whole pipeline (train, scores, removal, surgery, LDS, freeze) at a tiny scale, so that any problem
+# shows up here and not after an hour of real work
+subprocess.run([sys.executable, "scripts/run.py", "all", "configs/c10_resnet_bn.yaml", "seed=99",
+                "train_per_task=320", "first_task_train=640", "train.first_task_epochs=1", "train.epochs=1",
+                "probe_per_class=4", "ledger.tracin_checkpoints=3", "interventions.reps=1",
+                "interventions.removal_fracs=[0.1]", "interventions.lds_subsets=2", "interventions.surgery_targets=1",
+                "interventions.param_fracs=[0.1]", f"out_root={RUN_ROOT}/../_smoke", f"data_root={DATA_ROOT}"],
                cwd=REPO_DIR, check=True)
-from IPython.display import Markdown, display
-display(Markdown(open(f"{RUN_ROOT}/../results/results.md").read()))'''
+print(f"smoke test OK in {(time.time() - t0) / 60:.1f} min")'''
 
-ZIP = '''# Compact archive of everything needed for the paper (ledger tensors, scores, interventions, evals;
-# model snapshots are excluded to keep it small).
-import shutil, os, subprocess
-out = f"{RUN_ROOT}/../flgr_results"
-subprocess.run(f"cd {RUN_ROOT}/.. && zip -qr flgr_results.zip results runs -x '*/snapshots/*' '*/state/*'", shell=True)
-print(os.path.getsize(f"{RUN_ROOT}/../flgr_results.zip")/1e6, "MB")'''
+AGG = '''# Progress overview: which seeds are finished, forgetting and completeness of the ledger.
+import json, glob, os
+for d in sorted(glob.glob(f"{RUN_ROOT}/scifar10-task-resnet18r-bn-finetune-s*")):
+    m = [json.loads(l) for l in open(f"{d}/metrics.jsonl")] if os.path.exists(f"{d}/metrics.jsonl") else []
+    steps = sorted(os.listdir(f"{d}/interventions")) if os.path.isdir(f"{d}/interventions") else []
+    t1 = [x for x in m if x.get("task") == 1]
+    if t1:
+        acc0 = [x for x in m if x.get("task") == 0][0]["task_acc"][0]
+        print(os.path.basename(d), f"forgetting {100 * (acc0 - t1[0]['task_acc'][0]):.1f} pp",
+              f"completeness eps {100 * t1[0]['completeness']:.2f} %", "interventions:", steps)
+    else:
+        print(os.path.basename(d), "task B not finished yet")'''
+
+ZIP = '''# Compact archive for the paper analysis (ledgers, scores, interventions, evaluations; model snapshots
+# and resumable states are excluded). Download flgr_results.zip and send it back.
+import os, subprocess
+subprocess.run(f"cd {RUN_ROOT} && zip -qr ../flgr_results.zip . -x '*/snapshots/*' '*/state/*'", shell=True, check=True)
+print(f"{RUN_ROOT}/../flgr_results.zip", round(os.path.getsize(f"{RUN_ROOT}/../flgr_results.zip") / 1e6, 1), "MB")'''
 
 
 def colab():
     nb = nbf.v4.new_notebook()
     c = []
     c.append(nbf.v4.new_markdown_cell(
-        "# Forgetting Ledger — CIFAR experiments (Google Colab)\n\n"
+        "# Forgetting Ledger — ResNet-18 + BatchNorm on Split CIFAR-10 (Google Colab)\n\n"
         "1. *Runtime → Change runtime type → GPU* (T4 is enough).\n"
-        "2. Add a Colab secret **`GH_TOKEN`** (key icon on the left) holding a GitHub token with read access to the "
-        f"private repository `{REPO}`.\n"
+        "2. Only if the repository is private: add a Colab secret **`GH_TOKEN`** (key icon on the left) with a "
+        f"GitHub token that can read `{REPO}`.\n"
         "3. Run all cells. All outputs and checkpoints live on Google Drive, so after a disconnect simply "
-        "**re-run all cells** — every job resumes from its last checkpoint."))
+        "**re-run all cells** — every job resumes from its last checkpoint.\n"
+        "4. When all ten seeds are done, run the last cell and download `flgr_results.zip` from Drive "
+        "(`MyDrive/forgetting-ledger/flgr_results.zip`)."))
     c.append(nbf.v4.new_code_cell(
         "from google.colab import drive, userdata\n"
         "drive.mount('/content/drive')\n"
@@ -77,9 +82,10 @@ def colab():
         "import os; os.makedirs(RUN_ROOT, exist_ok=True)"))
     c.append(nbf.v4.new_code_cell(
         "import os, subprocess\n"
-        "tok = userdata.get('GH_TOKEN')\n"
+        "try:\n    tok = userdata.get('GH_TOKEN')\nexcept Exception:\n    tok = None   # public repository: no token needed\n"
+        "url = f'https://{tok}@github.com/Basil-Mohammad/forgetting-ledger.git' if tok else 'https://github.com/Basil-Mohammad/forgetting-ledger.git'\n"
         "if not os.path.exists(REPO_DIR):\n"
-        f"    subprocess.run(['git', 'clone', f'https://{{tok}}@github.com/{REPO}.git', REPO_DIR], check=True)\n"
+        "    subprocess.run(['git', 'clone', url, REPO_DIR], check=True)\n"
         "else:\n"
         "    subprocess.run(['git', '-C', REPO_DIR, 'pull'], check=True)\n"
         "subprocess.run(['pip', '-q', 'install', '-r', f'{REPO_DIR}/requirements.txt'], check=True)\n"
@@ -98,9 +104,9 @@ def kaggle():
     nb = nbf.v4.new_notebook()
     c = []
     c.append(nbf.v4.new_markdown_cell(
-        "# Forgetting Ledger — CIFAR experiments (Kaggle)\n\n"
+        "# Forgetting Ledger — ResNet-18 + BatchNorm on Split CIFAR-10 (Kaggle)\n\n"
         "1. *Settings → Accelerator → GPU T4 x2 or P100*, *Internet → On*.\n"
-        "2. *Add-ons → Secrets*: add **`GH_TOKEN`** (GitHub token with read access to the private repository).\n"
+        "2. Only if the repository is private: *Add-ons → Secrets* → **`GH_TOKEN`** (GitHub token with read access).\n"
         "3. Kaggle sessions stop after 12 h and only `/kaggle/working` is kept when you **Save Version (Save & Run All)**. "
         "To continue in a new session, add the previous version's output as an input dataset: the first cell copies "
         "`runs/` back and every job resumes from its checkpoint."))
@@ -115,13 +121,14 @@ def kaggle():
     c.append(nbf.v4.new_code_cell(
         "import subprocess\n"
         "from kaggle_secrets import UserSecretsClient\n"
-        "tok = UserSecretsClient().get_secret('GH_TOKEN')\n"
+        "try:\n    tok = UserSecretsClient().get_secret('GH_TOKEN')\nexcept Exception:\n    tok = None   # public repository: no token needed\n"
+        "url = f'https://{tok}@github.com/Basil-Mohammad/forgetting-ledger.git' if tok else 'https://github.com/Basil-Mohammad/forgetting-ledger.git'\n"
         "if not os.path.exists(REPO_DIR):\n"
-        f"    subprocess.run(['git', 'clone', f'https://{{tok}}@github.com/{REPO}.git', REPO_DIR], check=True)\n"
+        "    subprocess.run(['git', 'clone', url, REPO_DIR], check=True)\n"
         "subprocess.run(['pip', '-q', 'install', '-r', f'{REPO_DIR}/requirements.txt'], check=True)\n"
         "import torch; print(torch.__version__, torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO GPU')"))
     c.append(nbf.v4.new_code_cell(SMOKE))
-    c.append(nbf.v4.new_code_cell(JOBS.replace("configs/sc10_resnet.yaml seed=0 setting=task", "configs/sc10_resnet.yaml seed=0 setting=task\nall configs/sc100_resnet.yaml seed=0\nall configs/sc100_resnet.yaml seed=1\nall configs/sc100_resnet.yaml seed=2")))
+    c.append(nbf.v4.new_code_cell(JOBS))
     c.append(nbf.v4.new_code_cell(
         "# Kaggle hard limit is 12 h: stop starting new jobs after 11 h so the version can be saved cleanly.\n"
         "import time; T_START = time.time(); LIMIT_H = 11.0\n" + RUNNER.replace(
