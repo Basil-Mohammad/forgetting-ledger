@@ -936,6 +936,207 @@ def fig_anatomy(groups, out):
     return res_all
 
 
+# ----------------------------------------------------------------------------- counterfactual validity (RQ13)
+
+CF_PRED = [("ledger", "Ledger (ours)"), ("ledger_euler", "Euler ledger (TracIn)"), ("tracin_cp10", "TracIn-CP")]
+
+
+def _cf_masks(run: Run, N: int, labels: np.ndarray):
+    ic = run.cfg["interventions"]
+    out = {}
+    for si, f in enumerate(ic.get("cf_fracs", [0.01, 0.02, 0.05, 0.1, 0.2, 0.5])):
+        for j in range(int(ic.get("cf_per_size", 6))):
+            u = hash_uniform(int(run.cfg["seed"]), 91, 1, 100 * si + j, torch.arange(N)).squeeze(1).numpy()
+            out[f"rand@{f}#{j}"] = (u < float(f), float(f))
+    for c in np.unique(labels):
+        out[f"class@{int(c)}"] = (labels == c, "class")
+    return out
+
+
+def cf_points(run: Run):
+    """Rows (kind, size, subset, group, actual, pred_ledger, pred_euler, pred_cp, rep-level actuals)."""
+    R = run.json("interventions", "cf_task1.json") or {}
+    sc = run.scores(1)
+    if sc is None:
+        return None
+    S = sc["scores"]
+    N, G = S["ledger"].shape
+    rows = []
+    # structured sets from the removal experiment: top-q by every score (and the most protective samples)
+    RR = run.json("interventions", "removal_task1.json")
+    if RR and "none" in RR and "probe_L" in RR["none"]:
+        l0 = np.array(RR["none"]["probe_L"]); l0r = np.array([r["probe_L"] for r in RR["none"]["reps"]])
+        for k, v in RR.items():
+            if "@" not in k or "probe_L" not in v:
+                continue
+            m_, q = k.split("@")
+            sc_ = -S["ledger"].sum(1) if m_ == "ledger_helpful" else S[m_].sum(1) if m_ in S else None
+            if sc_ is None:
+                continue
+            kk = int(round(float(q) * N))
+            m = np.zeros(N, bool); m[torch.argsort(sc_, descending=True)[:kk].numpy()] = True
+            a = np.array(v["probe_L"]) - l0
+            ar = np.array([r["probe_L"] for r in v["reps"]]) - l0r
+            preds = {nm: -S[nm].numpy()[m].sum(0) for nm, _ in CF_PRED if nm in S}
+            for g in range(G):
+                rows.append(dict(kind="remove", size="topq", key=k, g=g, actual=a[g], reps=ar[:, g],
+                                 **{f"p_{nm}": pv[g] for nm, pv in preds.items()}))
+    if "none" not in R:
+        return rows or None
+    labels = sc["features"]["label"].numpy()
+    masks = _cf_masks(run, N, labels)
+    L0 = np.array(R["none"]["probe_L"]); L0r = np.array([r["probe_L"] for r in R["none"]["reps"]])
+    for key, (m, size) in masks.items():
+        for kind, k in (("remove", key), ("zero", "zero:" + key)):
+            if k not in R:
+                continue
+            a = np.array(R[k]["probe_L"]) - L0
+            ar = np.array([r["probe_L"] for r in R[k]["reps"]]) - L0r
+            preds = {nm: -S[nm].numpy()[m].sum(0) for nm, _ in CF_PRED if nm in S}
+            for g in range(G):
+                rows.append(dict(kind=kind, size=size, key=key, g=g, actual=a[g], reps=ar[:, g],
+                                 **{f"p_{nm}": v[g] for nm, v in preds.items()}))
+    return rows
+
+
+def _fit(a, p):
+    a, p = np.asarray(a, float), np.asarray(p, float)
+    ok = np.isfinite(a) & np.isfinite(p)
+    a, p = a[ok], p[ok]
+    if len(a) < 4 or p.std() == 0:
+        return dict(r=np.nan, rho=np.nan, slope=np.nan, icpt=np.nan, r2=np.nan)
+    slope, icpt = np.polyfit(p, a, 1)
+    r = np.corrcoef(a, p)[0, 1]
+    return dict(r=r, rho=sst.spearmanr(a, p).correlation, slope=slope, icpt=icpt, r2=r ** 2)
+
+
+def cf_analysis(runs: List[Run]):
+    """Per seed, per counterfactual kind (zero-weight / removal) and per subset size: correlation and
+    calibration of the ledger prediction with the realised change; split-half noise ceiling from the reps."""
+    per = defaultdict(lambda: defaultdict(list))            # (kind, size, pred) -> metric -> [per seed]
+    pts = defaultdict(list)                                 # (kind) -> pooled points for the scatter
+    for run in runs:
+        rows = cf_points(run)
+        if not rows:
+            continue
+        for kind in ("zero", "remove"):
+            rk = [r for r in rows if r["kind"] == kind]
+            if not rk:
+                continue
+            sizes = sorted({r["size"] for r in rk if not isinstance(r["size"], str)})
+            sizes += [z for z in ("class", "topq") if any(r["size"] == z for r in rk)]
+            if sizes and not isinstance(sizes[0], str):
+                sizes.append("all_random")
+            for sz in sizes:
+                sel = [r for r in rk if (not isinstance(r["size"], str) if sz == "all_random" else r["size"] == sz)]
+                if len(sel) < 4:
+                    continue
+                a = np.array([r["actual"] for r in sel])
+                # split-half reliability of the ground truth (rep 0 vs mean of the others), Spearman-Brown
+                reps = np.array([r["reps"] for r in sel])
+                if reps.shape[1] >= 2 and len(sel) > 3:
+                    h1, h2 = reps[:, 0], reps[:, 1:].mean(1)
+                    rr = np.corrcoef(h1, h2)[0, 1]
+                    rel = 2 * rr / (1 + rr) if rr > -1 else np.nan
+                else:
+                    rel = np.nan
+                per[(kind, sz, "ceiling")]["r"].append(np.sqrt(max(rel, 0)) if np.isfinite(rel) else np.nan)
+                for nm, _ in CF_PRED:
+                    if f"p_{nm}" not in sel[0]:
+                        continue
+                    p = np.array([r[f"p_{nm}"] for r in sel])
+                    if sz == "all_random":        # within-size centring removes the pure size effect of removal
+                        szs = np.array([r["size"] for r in sel], float)
+                        a_c, p_c = a.copy(), p.copy()
+                        for v in np.unique(szs):
+                            a_c[szs == v] -= a[szs == v].mean(); p_c[szs == v] -= p[szs == v].mean()
+                        f = _fit(a_c, p_c)
+                    else:
+                        f = _fit(a, p)
+                    for k_, v in f.items():
+                        per[(kind, sz, nm)][k_].append(v)
+            pts[kind] += [(r["size"], r["actual"], r["p_ledger"], run.seed) for r in rk if r["size"] != "topq"]
+    return per, pts
+
+
+def fig_cf(cf_by_bench, sens_by_bench, out):
+    benches = [b for b in cf_by_bench if cf_by_bench[b][1]]
+    if not benches:
+        return
+    fig, axes = plt.subplots(1, 3, figsize=(7.4, 2.55), gridspec_kw=dict(width_ratios=[1.0, 1.0, 1.0]))
+    # (a) scatter, zero-weight counterfactual, first benchmark, coloured by subset size; fitted slope
+    ax = axes[0]
+    per, pts = cf_by_bench[benches[0]]
+    P = pts.get("zero", [])
+    sizes = sorted({p[0] for p in P if p[0] != "class"})
+    cmap = plt.get_cmap("viridis")
+    for i, sz in enumerate(sizes + ["class"]):
+        q = [p for p in P if p[0] == sz]
+        if not q:
+            continue
+        col = PAL["red"] if sz == "class" else cmap(i / max(1, len(sizes) - 1))
+        ax.scatter([p[2] for p in q], [p[1] for p in q], s=3 if sz != "class" else 7, color=col, alpha=0.55, lw=0,
+                   label=("class" if sz == "class" else f"{100 * sz:g}%"), rasterized=True)
+    xs = np.array([p[2] for p in P]); ys = np.array([p[1] for p in P])
+    sl, ic = np.polyfit(xs, ys, 1)
+    xx = np.linspace(xs.min(), xs.max(), 10)
+    ax.plot(xx, sl * xx + ic, color=PAL["dark"], lw=0.9)
+    ax.text(0.97, 0.05, f"slope {sl:.3f}", transform=ax.transAxes, ha="right", fontsize=6.5)
+    ax.axhline(0, color=PAL["grey"], lw=0.5); ax.axvline(0, color=PAL["grey"], lw=0.5)
+    ax.set_xlabel("predicted $-\\sum_{i\\in S} C_{i,g}$ (nats)"); ax.set_ylabel("realised $\\Delta\\mathcal{L}_g$ (nats)")
+    ax.set_title(f"(a) {benches[0].split(' (')[0]}: zero weight", loc="left")
+    ax.legend(fontsize=5.2, markerscale=2, ncol=2, loc="upper left", handletextpad=0.1, columnspacing=0.5)
+    # (b) correlation vs subset size (zero weight): ledger for each benchmark, with the noise ceiling
+    ax = axes[1]
+    bcols = [PAL["blue"], PAL["orange"], PAL["aqua"], PAL["violet"]]
+    for bi, b in enumerate(benches):
+        per, _ = cf_by_bench[b]
+        szs = sorted({k[1] for k in per if k[0] == "zero" and not isinstance(k[1], str)})
+        ms = [S.mean_ci(per[("zero", z, "ledger")]["r"]) for z in szs]
+        x = [100 * z for z in szs]
+        ax.plot(x, [m["mean"] for m in ms], color=bcols[bi], marker="o", ms=3, label=b.split(" (")[0])
+        ax.fill_between(x, [m["lo"] for m in ms], [m["hi"] for m in ms], color=bcols[bi], alpha=0.15, lw=0)
+        ce = [S.mean_ci(per[("zero", z, "ceiling")]["r"]) for z in szs]
+        ax.plot(x, [m["mean"] for m in ce], color=bcols[bi], ls=":", lw=1.0)
+    ax.axhline(0, color=PAL["grey"], lw=0.6)
+    ax.set_xscale("log"); ax.set_xticks([1, 2, 5, 10, 20, 50]); ax.set_xticklabels(["1", "2", "5", "10", "20", "50"]); ax.minorticks_off()
+    ax.set_xlabel("subset size $|S|$ (% of new data)"); ax.set_ylabel("Pearson $r$ (predicted, realised)")
+    ax.set_title("(b) Validity vs. subset size", loc="left")
+    h_, l_ = ax.get_legend_handles_labels()
+    from matplotlib.lines import Line2D
+    h_.append(Line2D([], [], color=PAL["grey"], ls=":")); l_.append("noise ceiling")
+    ax.legend(h_, l_, fontsize=5.8, loc="upper left")
+    # (c) response curves over eps (single trajectory)
+    ax = axes[2]
+    for bi, b in enumerate(benches[:1]):
+        for sname, col, lab in [("rand1", PAL["blue"], "random 1%"), ("top1", PAL["red"], "most harmful 1%")]:
+            curves = sens_by_bench.get(b, {}).get(sname, [])
+            for ci, (e, dl, pr) in enumerate(curves):
+                ax.plot(e, np.abs(dl) + 1e-9, color=col, lw=0.9, alpha=0.8, label=lab if ci == 0 else None)
+                ax.plot(e, np.abs(e * pr), color=col, lw=0.7, ls=":", alpha=0.8)
+    ax.set_xscale("log"); ax.set_yscale("log")
+    ax.set_xlabel("re-weighting $\\varepsilon$")
+    ax.set_ylabel("$|\\Delta\\mathcal{L}|$ (nats)")
+    ax.set_title(f"(c) {benches[0].split(' (')[0]}: one trajectory", loc="left")
+    ax.legend(fontsize=5.8, loc="lower right")
+    fig.tight_layout()
+    savefig(fig, os.path.join(out, "fig_cf.pdf"))
+
+
+def sensitivity_curves(runs: List[Run]):
+    out = defaultdict(list)
+    for r in runs:
+        R = r.json("interventions", "sensitivity_task1.json")
+        if not R:
+            continue
+        for sname in ("rand1", "rand5", "top1"):
+            items = sorted([v for k, v in R.items() if k.startswith(sname + "@")], key=lambda v: v["eps"])
+            if items:
+                out[sname].append((np.array([v["eps"] for v in items]), np.array([sum(v["dL"]) for v in items]),
+                                   sum(items[0]["pred"])))
+    return out
+
+
 # ----------------------------------------------------------------------------- LaTeX writers
 
 class Tex:
@@ -974,6 +1175,9 @@ def main():
     ap.add_argument("--runs", default="./runs")
     ap.add_argument("--fig", default="./paper/figures")
     ap.add_argument("--tab", default="./paper/generated")
+    ap.add_argument("--cf", action="store_true", help="also write the counterfactual-validity study (RQ13; reported separately)")
+    ap.add_argument("--replicates", default=None,
+                    help="directory with re-runs of some runs (same names, other hardware): reproducibility check")
     a = ap.parse_args()
     os.makedirs(a.fig, exist_ok=True)
     setup_style()
@@ -1347,6 +1551,95 @@ def main():
     body += ["\\bottomrule", "\\end{tabular}"]
     tex.write("tab_numerics.tex", "\n".join(body) + "\n")
     json_out["numerics"] = num_json
+
+    # ------------------------------------------------------------------ BatchNorm: parameter path vs statistics channel
+    for (k, lab), runs in core.items():
+        rows = completeness_rows(runs)
+        if rows and np.nanmean([r["stats_abs"] for r in rows]) > 1e-6:
+            fig, ax = plt.subplots(figsize=(3.6, 2.3))
+            order = np.argsort([r["seed"] for r in rows])
+            x = np.arange(len(rows))
+            led = [r_.ledger(1) for r_ in runs]
+            pth = np.array([float(l["path_g"].sum()) for l in led])[order]
+            sts = np.array([float(l["stats"].sum()) for l in led])[order]
+            net = np.array([float(l["true_dL"].sum()) for l in led])[order]
+            ax.bar(x - 0.2, pth, 0.38, color=PAL["blue"], label="parameter path")
+            ax.bar(x + 0.2, sts, 0.38, color=PAL["orange"], label="statistics channel")
+            ax.plot(x, net, "D", color="black", ms=4, label="realised $\\Delta\\mathcal{L}$ (sum)")
+            ax.axhline(0, color=PAL["grey"], lw=0.7)
+            ax.set_xticks(x); ax.set_xticklabels([str(runs[i].seed) for i in order]); ax.set_xlabel("seed")
+            ax.set_ylabel("nats (sum over old classes)")
+            ax.legend(fontsize=6.2, loc="upper center", bbox_to_anchor=(0.5, -0.28), ncol=3, frameon=False)
+            ax.grid(axis="x", visible=False)
+            fig.tight_layout()
+            savefig(fig, os.path.join(a.fig, "fig_bn.pdf"))
+    # ------------------------------------------------------------------ hardware replicates (same seed, other GPU)
+    if a.replicates:
+        rep_rows = []
+        for d in sorted(glob.glob(os.path.join(a.replicates, "*"))):
+            nm = os.path.basename(d)
+            main_d = os.path.join(a.runs, nm)
+            if not (os.path.exists(os.path.join(d, "ledger", "task1.pt")) and os.path.exists(os.path.join(main_d, "ledger", "task1.pt"))):
+                continue
+            if os.path.realpath(main_d) == os.path.realpath(d):
+                continue
+            ha = torch.load(os.path.join(main_d, "ledger", "task1.pt"), weights_only=False)["data"].sum(1).numpy()
+            hb = torch.load(os.path.join(d, "ledger", "task1.pt"), weights_only=False)["data"].sum(1).numpy()
+            k1 = max(1, int(0.01 * len(ha)))
+            rep_rows.append(dict(run=nm, rho=sst.spearmanr(ha, hb).correlation,
+                                 top1=len(set(np.argsort(-ha)[:k1]) & set(np.argsort(-hb)[:k1])) / k1,
+                                 rho_abs=sst.spearmanr(np.abs(ha), np.abs(hb)).correlation))
+        if rep_rows:
+            tex.macro("repRho", f"{np.mean([r['rho'] for r in rep_rows]):.2f}")
+            tex.macro("repRhoAbs", f"{np.mean([r['rho_abs'] for r in rep_rows]):.2f}")
+            tex.macro("repTopOne", f"{100 * np.mean([r['top1'] for r in rep_rows]):.0f}")
+            tex.macro("repN", f"{len(rep_rows)}")
+            json_out["hardware_replicates"] = rep_rows
+
+    # ------------------------------------------------------------------ counterfactual validity (RQ13)
+    cf_by, sens_by = {}, {}
+    for (k, lab), runs in (core.items() if a.cf else []):
+        per, pts = cf_analysis(runs)
+        if per:
+            cf_by[lab] = (per, pts)
+            sens_by[lab] = sensitivity_curves(runs)
+    if cf_by:
+        fig_cf(cf_by, sens_by, a.fig)
+        body = ["\\begin{tabular}{llcccccc}", "\\toprule",
+                "Benchmark & counterfactual / $|S|$ & ledger $r$ & ledger slope & Euler $r$ & Euler slope & TracIn-CP $r$ & noise ceiling \\\\ \\midrule"]
+        cfj = {}
+        for lab, (per, pts) in cf_by.items():
+            key = re.sub(r"[^A-Za-z]", "", lab.split(" (")[0])
+            first = True
+            for kind, kname in (("zero", "zero weight"), ("remove", "removal")):
+                szs = sorted({k[1] for k in per if k[0] == kind and not isinstance(k[1], str)}) + ["all_random", "class", "topq"]
+                for z in szs:
+                    if (kind, z, "ledger") not in per:
+                        continue
+                    g = lambda nm, m: S.mean_ci(per[(kind, z, nm)][m]) if (kind, z, nm) in per else None
+                    zl = ("all random (size-centred)" if z == "all_random" else "whole classes" if z == "class"
+                          else "top-$q$ sets of all scores" if z == "topq" else f"{100 * z:g}\\%")
+                    cells = [ci_tex(g("ledger", "r"), digits=2), ci_tex(g("ledger", "slope"), digits=2),
+                             ci_tex(g("ledger_euler", "r"), digits=2), ci_tex(g("ledger_euler", "slope"), digits=2),
+                             ci_tex(g("tracin_cp10", "r"), digits=2), ci_tex(S.mean_ci(per[(kind, z, "ceiling")]["r"]), digits=2)]
+                    body.append(f"{lab if first else ''} & {kname}, {zl} & " + " & ".join(cells) + " \\\\")
+                    first = False
+                    cfj.setdefault(lab, {})[f"{kind}:{z}"] = {nm: {m: S.mean_ci(per[(kind, z, nm)][m]) for m in ("r", "rho", "slope", "r2")}
+                                                             for nm, _ in CF_PRED if (kind, z, nm) in per}
+                    tag = {0.01: "One", 0.05: "Five", 0.2: "Twenty", 0.5: "Fifty", "all_random": "All", "class": "Class", "topq": "Topq"}.get(z)
+                    if tag:
+                        kk = "Zero" if kind == "zero" else "Rem"
+                        tex.macro(f"cfR{kk}{tag}{key}", f"{np.nanmean(per[(kind, z, 'ledger')]['r']):.2f}")
+                        tex.macro(f"cfSlope{kk}{tag}{key}", f"{np.nanmean(per[(kind, z, 'ledger')]['slope']):.3f}")
+                        if (kind, z, "ledger_euler") in per:
+                            tex.macro(f"cfREuler{kk}{tag}{key}", f"{np.nanmean(per[(kind, z, 'ledger_euler')]['r']):.2f}")
+                            tex.macro(f"cfSlopeEuler{kk}{tag}{key}", f"{np.nanmean(per[(kind, z, 'ledger_euler')]['slope']):.2f}")
+                        tex.macro(f"cfCeil{kk}{tag}{key}", f"{np.nanmean(per[(kind, z, 'ceiling')]['r']):.2f}")
+            body.append("\\midrule")
+        body[-1] = "\\bottomrule"
+        body.append("\\end{tabular}")
+        tex.write("tab_cf.tex", "\n".join(body) + "\n")
+        json_out["counterfactual"] = cfj
 
     # ------------------------------------------------------------------ dose response
     dose = {float(re.findall(r"pf([0-9.]+)$", k)[0]): v for k, v in R.items() if re.search(r"-pf[0-9.]+$", k)}

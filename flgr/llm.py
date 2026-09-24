@@ -36,6 +36,21 @@ class LoRALinear(nn.Module):
         return self.base(x) + (x @ self.lora_A.T @ self.lora_B.T) * self.scale
 
 
+def _load_pretrained(cls, name: str):
+    """Load from the local cache first (no network request: every job would otherwise contact the Hub,
+    which can stall for hours under rate limiting); download only if the model is not cached yet."""
+    kw = dict(attn_implementation="eager")
+    for local in (True, False):
+        for dt in ("dtype", "torch_dtype"):                     # transformers >= 4.56 uses `dtype`
+            try:
+                return cls.from_pretrained(name, local_files_only=local, **{dt: torch.float32}, **kw)
+            except TypeError:
+                continue
+            except OSError:
+                break                                            # not cached: retry with downloads allowed
+    raise RuntimeError(f"could not load {name}")
+
+
 class LLMClassifier(nn.Module):
     no_vmap = True                     # per-sample gradients are obtained by double backward, not vmap
     eval_chunk = 256
@@ -52,10 +67,7 @@ class LLMClassifier(nn.Module):
             torch.manual_seed(1234)
             lm = AutoModelForCausalLM.from_config(conf, attn_implementation="eager")
         else:
-            try:                                            # transformers >= 4.56 uses `dtype`
-                lm = AutoModelForCausalLM.from_pretrained(m["hf_name"], dtype=torch.float32, attn_implementation="eager")
-            except TypeError:
-                lm = AutoModelForCausalLM.from_pretrained(m["hf_name"], torch_dtype=torch.float32, attn_implementation="eager")
+            lm = _load_pretrained(AutoModelForCausalLM, m["hf_name"])
         for k in ("attention_dropout", "hidden_dropout", "attn_pdrop", "resid_pdrop", "embd_pdrop", "dropout"):
             if hasattr(lm.config, k):
                 setattr(lm.config, k, 0.0)

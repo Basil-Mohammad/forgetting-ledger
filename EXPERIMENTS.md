@@ -236,3 +236,34 @@ the vision benchmarks. Larger models (Pythia-410M, Qwen2.5-0.5B) were considered
 the full intervention protocol would need > 30 GPU-hours on a T4.
 Completeness check: the Split CIFAR-10 CNN runs are re-tracked on a GPU with up to 16 quadrature
 sub-intervals (`tag=n16`, tracked run only; interventions unchanged).
+
+**2026-09-24, RQ13 (registered before any subset-removal result was computed).** *Counterfactual validity
+of the realised ledger.* The ledger is an exact account of the realised run; RQ13 asks how well its entries
+predict what happens under a counterfactual. For a removed subset S, the prediction for the change of the
+probe loss of old group g is  pred_g(S) = -sum_{i in S} C_{i,g};  the ground truth is the change of the
+same probe loss after retraining without S (three visiting orders, paired with the full retrain).
+Design (`python scripts/run.py cf <config> seed=s`): random subsets of 1, 2, 5, 10, 20 and 50 % of the
+new-task data (six per size) and structured subsets (every new class removed in full), ten seeds, on PM and
+SF (CPU); the existing top-q removal and LDS subsets of every benchmark are analysed in the same way.
+Metrics (per seed, then mean and bootstrap CI over seeds; points = subsets x old groups): Pearson and
+Spearman correlation, calibration slope and intercept of actual on predicted, R^2, and the absolute error
+as a function of |S|; the retraining noise floor is estimated from the spread across visiting orders.
+Comparators with loss units: the Euler ledger and TracIn-CP.
+Hypotheses. H13a: for |S| <= 5 % the ledger is calibrated (slope in [0.5, 2]) with Pearson >= 0.7 once the
+retraining noise floor is accounted for. H13b: calibration degrades as |S| grows (interactions / change of
+trajectory), i.e. |slope - 1| increases with |S|. H13c: the ledger is better calibrated than the Euler
+ledger, whose totals are biased (Prop. 5).
+*Pilot note (same day, before the full RQ13 runs).* A pilot on one PM subset showed that the counterfactual
+response of plain SGD to data re-weighting is not smooth: down-weighting 1 % of the samples by a factor
+1 - eps with identical batches and order changes the final probe loss by ~1e-6 for eps <= 2e-4 but by
+~5e-3 to 5e-2 for eps >= 3e-4 (with non-monotone jumps; |Delta theta| jumps from 2e-5 to 4e-2). ReLU networks
+make the SGD update map discontinuous at activation boundaries, so single-trajectory counterfactuals are
+dominated by path sensitivity. RQ13 is therefore evaluated (i) in expectation over visiting orders and seeds
+(as registered), with (ii) the "zero-weight" counterfactual (same batches and step count, the loss terms of S
+set to zero -- the ledger's own counterfactual) added next to true removal (which also shortens training),
+and (iii) a response-curve analysis over eps (1e-5 ... 1) on three seeds per benchmark, to characterise the
+regime in which any single-run attribution can be counterfactually valid.
+
+*RQ13 reporting decision (2026-09-24).* The counterfactual-validity study (RQ13) is reported as a separate,
+follow-up study and not in the main paper; its data, code (`cf`, `scripts/sensitivity.py`) and analysis
+(`python -m flgr.analysis.paper --cf`) are part of this repository.

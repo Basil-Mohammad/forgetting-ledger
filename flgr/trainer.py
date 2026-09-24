@@ -141,10 +141,12 @@ class Trainer:
 
     def train_task(self, t: int, start_epoch: int = 0, start_batch: int = 0, resume_acc=None,
                    keep: Optional[torch.Tensor] = None, frozen: Optional[torch.Tensor] = None,
-                   track: Optional[bool] = None, save: bool = True, order_rep: int = 0) -> Optional[LedgerAccumulator]:
+                   track: Optional[bool] = None, save: bool = True, order_rep: int = 0,
+                   zero: Optional[torch.Tensor] = None) -> Optional[LedgerAccumulator]:
         """Train task t. ``keep`` (bool over task positions) removes samples; ``frozen`` (bool over
         parameters) freezes parameters. Returns the ledger accumulator (if tracked)."""
         track = self.track if track is None else track
+        self._zero = zero          # bool over task positions: loss weight set to 0, batches and steps unchanged
         track = track and t > 0
         self.lr = self.first_lr if t == 0 else self.base_lr
         self.epochs = self.first_epochs if t == 0 else self.base_epochs
@@ -256,7 +258,15 @@ class Trainer:
     def _plain_step(self, t, epoch, pos, step_key, frozen):
         model = self.model
         terms, logits, gidx = self.learner.terms(model, t, epoch, pos, step_key)
-        grads = torch.autograd.grad(terms.values.sum(), params_of(model))
+        vals = terms.values
+        if getattr(self, "_zero", None) is not None:           # counterfactual: drop these samples' terms only
+            w = torch.ones_like(vals)
+            for kind, ids, sl in zip(terms.kinds, terms.ids, terms.slices):
+                if kind == "new":
+                    z = self._zero[ids]
+                    w[sl] = (~z).to(vals.dtype) if z.dtype == torch.bool else z.to(vals.dtype)   # bool: drop; float: weights
+            vals = vals * w
+        grads = torch.autograd.grad(vals.sum(), params_of(model))
         g = flat(grads)
         proj = self.learner.project(model, t, g, step_key)
         if proj is not None and proj.active:

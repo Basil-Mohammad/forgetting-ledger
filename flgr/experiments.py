@@ -168,11 +168,11 @@ def _load_scores(tr, t):
 # ----------------------------------------------------------------------------- counterfactual retraining
 
 def retrain(tr: Trainer, t: int, keep: Optional[torch.Tensor] = None, frozen: Optional[torch.Tensor] = None,
-            rep: int = 0) -> dict:
+            rep: int = 0, zero: Optional[torch.Tensor] = None) -> dict:
     """Retrain task t from its saved start state (untracked) and evaluate. ``rep`` > 0 uses an
     alternative visiting order (variance reduction by averaging over orders)."""
     tr.load_snapshot(f"task{t}_start")
-    tr.train_task(t, keep=keep, frozen=frozen, track=False, save=False, order_rep=rep)
+    tr.train_task(t, keep=keep, frozen=frozen, track=False, save=False, order_rep=rep, zero=zero)
     out = measure(tr, t)
     out["time_s"] = tr.last_train_time
     out["steps"] = tr.last_train_steps
@@ -192,12 +192,12 @@ def measure(tr: Trainer, t: int) -> dict:
 AVG_KEYS = ("new_acc", "old_acc", "old_test_loss")
 
 
-def retrain_avg(tr: Trainer, t: int, prev: Optional[dict], n_rep: int, keep=None, frozen=None) -> dict:
+def retrain_avg(tr: Trainer, t: int, prev: Optional[dict], n_rep: int, keep=None, frozen=None, zero=None) -> dict:
     """Average of ``n_rep`` retrainings with different visiting orders (rep 0 = the original order).
     ``prev`` (an earlier single result or average) is reused and extended."""
     reps = list(prev.get("reps", [prev])) if prev else []
     for r in range(len(reps), n_rep):
-        reps.append(retrain(tr, t, keep=keep, frozen=frozen, rep=r))
+        reps.append(retrain(tr, t, keep=keep, frozen=frozen, rep=r, zero=zero))
     out = dict(reps=reps)
     for k in ("task_acc", "group_acc", "probe_L", "group_test_loss"):
         if all(k in x for x in reps):
@@ -300,6 +300,56 @@ def cmd_lds(cfg, run_dir):
         R[key] = retrain(tr, t, keep=keep)
         _save_results(tr, f"lds_task{t}", R)
         print(f"[lds] task {t} subset {j}: old {R[key]['old_acc']:.4f}", flush=True)
+
+
+def cf_subsets(cfg, sc, t: int):
+    """Counterfactual-validity design (RQ13): random subsets at several sizes and structured subsets
+    (every new class removed in full). Returns [(key, removed_mask)] -- a pure function of the seed."""
+    ic = cfg["interventions"]
+    N = len(sc.tasks[t].train_idx)
+    dev = sc.device
+    out = []
+    for si, f in enumerate(ic.get("cf_fracs", [0.01, 0.02, 0.05, 0.1, 0.2, 0.5])):
+        for j in range(int(ic.get("cf_per_size", 6))):
+            u = hash_uniform(int(cfg["seed"]), 91, t, 100 * si + j, torch.arange(N, device=dev)).squeeze(1)
+            out.append((f"rand@{f}#{j}", u < float(f)))
+    if ic.get("cf_classes", True):
+        ylab = sc.ytr[sc.tasks[t].train_idx]
+        for c in sc.tasks[t].classes:
+            out.append((f"class@{c}", ylab == c))
+    return out
+
+
+def cmd_cf(cfg, run_dir):
+    """Remove each subset S, retrain (same visiting orders as the full retrain), and record the realised
+    change of every old-group probe loss -- the quantity the ledger predicts as -sum_{i in S} C_i."""
+    tr = setup(cfg, run_dir, log=False)
+    _require_trained(tr)
+    ic = cfg["interventions"]
+    n_rep = int(ic.get("reps", 3))
+    for t in _tasks(cfg, tr.sc):
+        R = _results(tr, f"cf_task{t}")
+        if _needs(R, "none", n_rep):
+            R["none"] = retrain_avg(tr, t, R.get("none"), n_rep)
+            _save_results(tr, f"cf_task{t}", R)
+        for key, removed in cf_subsets(cfg, tr.sc, t):
+            if not _needs(R, key, n_rep):
+                continue
+            R[key] = retrain_avg(tr, t, R.get(key), n_rep, keep=~removed)
+            R[key]["n_removed"] = int(removed.sum())
+            _save_results(tr, f"cf_task{t}", R)
+            dL = np.array(R[key]["probe_L"]) - np.array(R["none"]["probe_L"])
+            print(f"[cf] task {t} {key}: |S|={int(removed.sum())} dL_probe={dL.sum():+.4f}", flush=True)
+        # the ledger's own counterfactual: same batches and number of steps, the loss terms of S set to zero
+        for key, removed in cf_subsets(cfg, tr.sc, t):
+            zkey = "zero:" + key
+            if not _needs(R, zkey, n_rep):
+                continue
+            R[zkey] = retrain_avg(tr, t, R.get(zkey), n_rep, zero=removed)
+            R[zkey]["n_removed"] = int(removed.sum())
+            _save_results(tr, f"cf_task{t}", R)
+            dL = np.array(R[zkey]["probe_L"]) - np.array(R["none"]["probe_L"])
+            print(f"[cf] task {t} {zkey}: |S|={int(removed.sum())} dL_probe={dL.sum():+.4f}", flush=True)
 
 
 # ----------------------------------------------------------------------------- parameter-level (RQ4)

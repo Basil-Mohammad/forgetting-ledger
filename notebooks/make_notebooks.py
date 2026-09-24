@@ -45,12 +45,25 @@ subprocess.run(["pip", "-q", "install", "-r", f"{{REPO_DIR}}/requirements.txt"{e
 import torch
 print(torch.__version__, [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())] or "NO GPU")'''
 
+PREFETCH = '''# Download the language model, tokenizer and datasets once, then switch every later job to OFFLINE mode
+# (without this, every job contacts the Hugging Face Hub, and unauthenticated requests can stall for hours).
+import os
+os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "60"; os.environ["HF_HUB_ETAG_TIMEOUT"] = "30"
+from huggingface_hub import snapshot_download
+from datasets import load_dataset
+snapshot_download("EleutherAI/pythia-160m")
+load_dataset("fancyzhx/ag_news"); load_dataset("fancyzhx/dbpedia_14")
+os.environ["HF_HUB_OFFLINE"] = "1"; os.environ["HF_DATASETS_OFFLINE"] = "1"; os.environ["TRANSFORMERS_OFFLINE"] = "1"
+print("model and data cached; offline mode on")'''
+
 SMOKE = '''# Smoke test on this GPU: the whole pipeline at a tiny scale (a few minutes). Run once before the real jobs.
 import subprocess, sys, time
 t0 = time.time()
-subprocess.run([sys.executable, "scripts/run.py", *{smoke}, f"out_root={{RUN_ROOT}}/../_smoke", f"data_root={{DATA_ROOT}}"],
-               cwd=REPO_DIR, check=True)
-print(f"smoke test OK in {{(time.time() - t0) / 60:.1f}} min")'''
+r = subprocess.run([sys.executable, "scripts/run.py", *{smoke}, f"out_root={{RUN_ROOT}}/../_smoke", f"data_root={{DATA_ROOT}}"],
+                   cwd=REPO_DIR, capture_output=True, text=True, timeout=3600)
+print(r.stdout[-4000:], r.stderr[-4000:])
+assert r.returncode == 0, "smoke test failed - send the output above"
+print(f"smoke test OK in {{(time.time() - t0) / 60:.1f}} min", flush=True)'''
 
 JOBS = '''# One entry per job: "<command> <config> [overrides...]". Every job is resumable; finished steps are skipped.
 {jobs}
@@ -62,6 +75,7 @@ RUNNER = '''# Runs the jobs, one per GPU in parallel (Kaggle "T4 x2": two at a t
 import subprocess, sys, time, os, threading, queue, torch
 LOGS = f"{{RUN_ROOT}}/../logs"; os.makedirs(LOGS, exist_ok=True)
 NGPU = max(1, torch.cuda.device_count())
+JOB_TIMEOUT_H = 3.0          # a job that runs longer than this is stopped (it resumes when the cell is re-run)
 q = queue.Queue()
 for j in JOBS:
     q.put(j)
@@ -79,11 +93,16 @@ def worker(gpu):
         t0 = time.time()
         print(f"[gpu{{gpu}}] >>> {{' '.join(job)}}", flush=True)
         with open(f"{{LOGS}}/{{name}}.log", "a") as f:
-            rc = subprocess.call([sys.executable, "scripts/run.py", *job, f"out_root={{RUN_ROOT}}", f"data_root={{DATA_ROOT}}"],
-                                 cwd=REPO_DIR, stdout=f, stderr=subprocess.STDOUT, env=env)
+            try:
+                rc = subprocess.call([sys.executable, "scripts/run.py", *job, f"out_root={{RUN_ROOT}}", f"data_root={{DATA_ROOT}}"],
+                                     cwd=REPO_DIR, stdout=f, stderr=subprocess.STDOUT, env=env, timeout=JOB_TIMEOUT_H * 3600)
+            except subprocess.TimeoutExpired:
+                rc = "timeout"
         print(f"[gpu{{gpu}}] <<< exit {{rc}} after {{(time.time() - t0) / 60:.1f}} min: {{' '.join(job)}}", flush=True)
         if rc != 0:
             print(open(f"{{LOGS}}/{{name}}.log").read()[-3000:], flush=True)
+        else:
+            print("   " + open(f"{{LOGS}}/{{name}}.log").read().strip().splitlines()[-1][:200], flush=True)
 threads = [threading.Thread(target=worker, args=(g,)) for g in range(NGPU)]
 [t.start() for t in threads]; [t.join() for t in threads]
 print("all workers finished")'''
@@ -168,6 +187,8 @@ def _cells(exp, platform):
         token = ("try:\n    from kaggle_secrets import UserSecretsClient\n    tok = UserSecretsClient().get_secret('GH_TOKEN')\n"
                  "except Exception:\n    tok = None   # public repository: no token needed")
     c.append(nbf.v4.new_code_cell(SETUP_REPO.format(token=token, repo=REPO, url=URL, extra=extra)))
+    if exp == "llm":
+        c.append(nbf.v4.new_code_cell(PREFETCH))
     c.append(nbf.v4.new_code_cell(SMOKE.format(smoke=repr(E["smoke"]))))
     c.append(nbf.v4.new_code_cell(JOBS.format(jobs=E["jobs"])))
     c.append(nbf.v4.new_code_cell(RUNNER.format()))

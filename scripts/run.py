@@ -7,7 +7,8 @@
     python scripts/run.py lds     configs/pm5_mlp.yaml seed=0            # RQ2 linear datamodeling score
     python scripts/run.py params  configs/pm5_mlp.yaml seed=0            # RQ4 rollback / freeze-and-retrain
     python scripts/run.py surgery configs/pm5_mlp.yaml seed=0            # RQ3 class-targeted removal
-    python scripts/run.py all     configs/pm5_mlp.yaml seed=0            # everything above, in order
+    python scripts/run.py cf      configs/pm5_mlp.yaml seed=0            # RQ13 counterfactual validity (subset removal)
+    python scripts/run.py all     configs/pm5_mlp.yaml seed=0            # train, scores, removal, surgery, lds, params
 
 Every sub-command is idempotent and resumable: finished units of work are skipped.
 """
@@ -23,7 +24,7 @@ from flgr import experiments  # noqa: E402
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("command", choices=["train", "scores", "removal", "lds", "params", "surgery", "all"])
+    ap.add_argument("command", choices=["train", "scores", "removal", "lds", "params", "surgery", "cf", "all"])
     ap.add_argument("config")
     ap.add_argument("overrides", nargs="*")
     ap.add_argument("--run-dir", default=None)

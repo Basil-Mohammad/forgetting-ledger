@@ -69,7 +69,10 @@ def _load_hf(cfg: dict):
     cache = os.path.join(root, "text_cache", f"agdbp_{key}.pt")
     if os.path.exists(cache):
         return torch.load(cache, weights_only=False)
-    tok = AutoTokenizer.from_pretrained(name)
+    try:
+        tok = AutoTokenizer.from_pretrained(name, local_files_only=True)
+    except OSError:
+        tok = AutoTokenizer.from_pretrained(name)
     s = int(cfg.get("data_seed", 0))
     xs, ys, xt, yt = [], [], [], []
 
