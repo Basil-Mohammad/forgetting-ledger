@@ -123,3 +123,34 @@ def test_adam_ledger_is_complete(tmp_path):
     src = led["data"].sum(0) + led["reg"]                       # new samples + momentum carried over
     assert torch.allclose(src, led["path_g"], rtol=1e-4, atol=1e-6), (src, led["path_g"])
     assert led["reg"].abs().sum() > 0
+
+
+def test_llm_lora_adam_ledger_is_exact(tmp_path):
+    """Tiny GPT-NeoX with LoRA adapters (verbalizer classifier) trained with Adam: the two-pass adjoint
+    ledger splits the parameter path exactly over samples (+ momentum carry-over), the snapshots hold
+    only the adapters, and the double-backward TracIn scores equal explicit per-sample gradients."""
+    pytest.importorskip("transformers")
+    cfg = cfg_for("llm_pythia.yaml", **{"model.hf_name": "tiny", "first_task_train_per_class": 40,
+                                        "train_per_class": 24, "pool_per_class": 80, "test_per_class": 10,
+                                        "probe_per_class": 6, "seq_len": 20})
+    cfg["train"].update(optimizer="adam", lr=0.003, batch_size=8, epochs=1, first_task_epochs=2)
+    tr = setup(cfg, str(tmp_path), log=False)
+    tr.run()
+    led = torch.load(tmp_path / "ledger" / "task1.pt", weights_only=False)
+    rel = float((led["path_g"] - led["true_dL"]).abs().sum() / led["true_dL"].abs().sum())
+    assert rel < 0.01, rel
+    src = led["data"].sum(0) + led["reg"]
+    assert torch.allclose(src, led["path_g"], rtol=1e-4, atol=1e-6), (src, led["path_g"])
+    assert float(led["data_euler"].abs().sum()) > 0
+    snap = torch.load(tmp_path / "snapshots" / "task1_start.pt", weights_only=False)
+    assert all("lora_" in k for k in snap["model"]), list(snap["model"])[:5]
+    # double-backward dot products == explicit per-sample gradients
+    from flgr.scores import _dots_double_backward, per_sample_grads
+    from flgr.ledger import ProbeSet, probe_grads
+    probe = ProbeSet(tr.sc, 1, 1, "class", tr.device)
+    _, Gm = probe_grads(tr.model, probe)
+    x, y, _ = tr.sc.probe_batch(0)
+    mask = tr.sc.logit_mask(1, torch.zeros(len(y), dtype=torch.long), n=len(y))
+    d1 = _dots_double_backward(tr.model, x[:6], y[:6], mask[:6], Gm, chunk=4)[0]
+    d2 = per_sample_grads(tr.model, x[:6], y[:6], mask[:6]) @ Gm.T
+    assert torch.allclose(d1, d2, rtol=1e-4, atol=1e-7)

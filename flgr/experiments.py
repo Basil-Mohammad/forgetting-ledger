@@ -30,7 +30,11 @@ def setup(cfg: dict, run_dir: str, track: bool = True, log: bool = True):
     device = pick_device(cfg.get("device", "auto"))
     if device.type == "cpu":                     # respect OMP_NUM_THREADS (parallel workers must not oversubscribe)
         torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", 0)) or max(1, os.cpu_count() or 1))
-    sc = Scenario(cfg, device)
+    if cfg["benchmark"] == "agnews_dbpedia":
+        from .text import TextScenario
+        sc = TextScenario(cfg, device)
+    else:
+        sc = Scenario(cfg, device)
     model = build_model(cfg, sc).to(device)
     learner = build_learner(cfg, sc, device)
     os.makedirs(run_dir, exist_ok=True)
@@ -91,7 +95,8 @@ def cmd_scores(cfg, run_dir):
         probe = ProbeSet(sc, t, t, tr.group_by, tr.device)
         S: Dict[str, torch.Tensor] = {"ledger": led["data"].float()}
         for k, v in led["early"].items():
-            S[f"ledger_early{int(float(k) * 100)}"] = v.float()
+            if float(v.abs().sum()) > 0:                  # (the two-pass Adam ledger has no early snapshots)
+                S[f"ledger_early{int(float(k) * 100)}"] = v.float()
         N, G = S["ledger"].shape
         # --- checkpoint-based gradient scores (TracIn-CP family) and TRAK-style projected influence
         cps = led["cp_steps"]
@@ -116,7 +121,8 @@ def cmd_scores(cfg, run_dir):
                 trak += trak_harm(Psi, Gm @ R)
             if j == 0:
                 S["static_tracin"] = -dots
-                S["grad_cos"] = -cos
+                if cos is not None:
+                    S["grad_cos"] = -cos
                 S["loss"] = loss_scores(model, sc, t).view(-1, 1).expand(-1, G).contiguous()
                 S["feature_prox"] = feature_proximity(model, sc, t, probe)
                 sim = feature_class_similarity(model, sc, t, probe)

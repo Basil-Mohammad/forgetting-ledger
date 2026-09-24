@@ -49,6 +49,8 @@ BENCH = {  # config-name prefix -> short label
     "pmnist-domain-mlp-finetune": "PM (MLP)",
     "sfmnist-task-mlp-finetune": "Split-FMNIST (MLP)",
     "scifar10-task-cnn-none-finetune": "Split-CIFAR-10 (CNN)",
+    "scifar10-task-resnet18r-bn-finetune": "ResNet-18 BN (C10)",
+    "agnews_dbpedia-task-llm-finetune": "Pythia-160M LoRA (AG to DBpedia)",
 }
 
 
@@ -188,7 +190,10 @@ def completeness_rows(runs: List[Run]):
                          end=float(np.sum(st["end"]) / np.sum(st["true"])) if st else np.nan,
                          start_g=np.array(st["start"]) if st else None, end_g=np.array(st["end"]) if st else None,
                          true_g=np.array(st["true"]) if st else None, ledger_g=np.array(st["ledger"]) if st else None,
-                         steps=int(led["steps"])))
+                         steps=int(led["steps"]),
+                         stats_ratio=float(led["stats"].sum() / led["true_dL"].sum()) if abs(float(led["true_dL"].sum())) > 1e-12 else np.nan,
+                         stats_abs=float(led["stats"].abs().sum() / max(float(led["true_dL"].abs().sum()), 1e-12)),
+                         path_ratio=float(led["path_g"].sum() / led["true_dL"].sum()) if abs(float(led["true_dL"].sum())) > 1e-12 else np.nan))
     return rows
 
 
@@ -355,7 +360,7 @@ def params(runs: List[Run]):
 def fig_concentration(groups, out):
     fig, axes = plt.subplots(1, 2, figsize=(6.6, 2.35), gridspec_kw=dict(width_ratios=[1.35, 1]))
     ax = axes[0]
-    cols = [PAL["blue"], PAL["orange"], PAL["aqua"]]
+    cols = [PAL["blue"], PAL["orange"], PAL["aqua"], PAL["violet"]]
     summ = {}
     for (cname, lab), c in zip(groups, cols):
         con = concentration(groups[(cname, lab)])
@@ -383,7 +388,8 @@ def fig_concentration(groups, out):
         ax.bar(x + (j - 0.5) * 0.36, [100 * v["mean"] for v in vals], 0.34, color=c, label=name,
                yerr=[[100 * (v["mean"] - v["lo"]) for v in vals], [100 * (v["hi"] - v["mean"]) for v in vals]],
                error_kw=dict(lw=0.8, capsize=2, ecolor="#52514e"))
-    short = {"PM (MLP)": "PM\n(MLP)", "Split-FMNIST (MLP)": "SF\n(MLP)", "Split-CIFAR-10 (CNN)": "C10\n(CNN)"}
+    short = {"PM (MLP)": "PM\n(MLP)", "Split-FMNIST (MLP)": "SF\n(MLP)", "Split-CIFAR-10 (CNN)": "C10\n(CNN)",
+             "ResNet-18 BN (C10)": "C10\n(ResNet-BN)", "Pythia-160M LoRA (AG to DBpedia)": "AG$\\to$DBp\n(Pythia)"}
     ax.set_xticks(x); ax.set_xticklabels([short.get(l, l) for l in labs])
     ax.set_ylabel("share of harmful mass (%)")
     ax.legend(loc="upper right")
@@ -470,8 +476,8 @@ def fig_forest(pr, labs, out):
     """Forest plot: paired difference in forgetting prevented, ledger minus comparator."""
     order = [m for m in FAM_TRAJ + FAM_CONF if m in pr]
     scopes = [l for l in labs if any(l in pr[m] for m in order)] + ["pooled"]
-    cols = [PAL["blue"], PAL["orange"], PAL["aqua"], PAL["dark"]]
-    mks = ["o", "s", "^", "D"]
+    cols = [PAL["blue"], PAL["orange"], PAL["aqua"], PAL["violet"], PAL["dark"]]
+    mks = ["o", "s", "^", "v", "D"]
     fig, ax = plt.subplots(figsize=(5.6, 0.36 * len(order) + 1.2))
     off = np.linspace(-0.27, 0.27, len(scopes))
     for i, m in enumerate(order):
@@ -523,7 +529,7 @@ def fig_stability(groups, transfer, out):
     ax = axes[1]
     stab = {}
     styles = [("ledger", "-"), ("tracin_cp10", "--"), ("static_tracin", "-"), ("loss", ":")]
-    cols = [PAL["blue"], PAL["orange"], PAL["aqua"]]
+    cols = [PAL["blue"], PAL["orange"], PAL["aqua"], PAL["violet"]]
     for (key, runs), c in zip(groups.items(), cols):
         for m, ls in styles:
             st = stability(runs, which=m)
@@ -609,7 +615,7 @@ def fig_numerics(core, rules, lrs, out):
     fig, axes = plt.subplots(1, 3, figsize=(7.3, 2.45))
     # (a) single-point ratios per group (scatter vs truth), pooled core benchmarks
     ax = axes[0]
-    for (key, lab), c in zip(core, [PAL["blue"], PAL["orange"], PAL["aqua"]]):
+    for (key, lab), c in zip(core, [PAL["blue"], PAL["orange"], PAL["aqua"], PAL["violet"]]):
         rows = completeness_rows(core[(key, lab)])
         T = np.concatenate([r["true_g"] for r in rows if r["true_g"] is not None]) if rows else np.array([])
         if len(T) == 0:
@@ -911,7 +917,7 @@ def fig_anatomy(groups, out):
              ("margin_start", "margin before task"), ("gradnorm_start", "gradient norm"), ("prox_start", "similarity to old classes")]
     fig, ax = plt.subplots(figsize=(3.6, 2.7))
     width = 0.8 / max(1, len(groups))
-    cols = [PAL["blue"], PAL["orange"], PAL["aqua"]]
+    cols = [PAL["blue"], PAL["orange"], PAL["aqua"], PAL["violet"]]
     res_all = {}
     for i, ((cname, lab), runs) in enumerate(groups.items()):
         res = anatomy(runs)
@@ -1275,6 +1281,9 @@ def main():
     # ------------------------------------------------------------------ interference maps
     from ..data import CIFAR10_NAMES, FASHION_NAMES
     def names_by(run):
+        if run.cfg["benchmark"] == "agnews_dbpedia":
+            from ..text import AG_LABELS, DBP_KEEP
+            return AG_LABELS + list(DBP_KEEP.values())
         return FASHION_NAMES if run.cfg["benchmark"] == "sfmnist" else CIFAR10_NAMES if run.cfg["benchmark"] == "scifar10" else [str(i) for i in range(10)]
     imaps = fig_imap({k: v for k, v in core.items() if k[0] != "pmnist-domain-mlp-finetune"}, a.fig, names_by)
     # H6: does the class-level harm map follow feature similarity (new-class centroid vs. old class, at the
@@ -1299,6 +1308,16 @@ def main():
     if "pmnist-domain-mlp-finetune-rule-adaptive" in R:
         lrs.setdefault(0.1, R["pmnist-domain-mlp-finetune-rule-adaptive"])
     fig_numerics(core, rules, lrs, a.fig)
+    # completeness of the re-tracked Split CIFAR-10 CNN with 16 quadrature sub-intervals (GPU)
+    n16 = R.get("scifar10-task-cnn-none-finetune-n16", [])
+    if n16:
+        rows16 = completeness_rows(n16)
+        tex.macro("epsCNNsixteen", f"{100 * np.mean([r['eps'] for r in rows16]):.2f}")
+        tex.macro("epsCNNsixteenMax", f"{100 * np.max([r['eps'] for r in rows16]):.2f}")
+        tex.macro("epsTVCNNsixteen", f"{100 * np.mean([r['eps_tv'] for r in rows16]):.3f}")
+        tex.macro("evalsCNNsixteen", f"{np.mean([r['evals'] for r in rows16]) + 1:.1f}")
+        tex.macro("nCNNsixteen", f"{len(rows16)}")
+        json_out["c10_cnn_n16"] = dict(eps=S.mean_ci([r["eps"] for r in rows16]), eps_tv=S.mean_ci([r["eps_tv"] for r in rows16]))
     body = ["\\begin{tabular}{lccccc}", "\\toprule",
             "Benchmark & $\\varepsilon$ (\\%) & $\\varepsilon_{\\mathrm{TV}}$ (\\%) & Euler $\\varepsilon$ (\\%) & start / realised & end / realised \\\\ \\midrule"]
     num_json = {}
@@ -1313,6 +1332,13 @@ def main():
         tex.macro(f"eulerErr{key}", f"{100 * eu['mean']:.0f}")
         tex.macro(f"ratioStart{key}", f"{st['mean']:.2f}")
         tex.macro(f"ratioEnd{key}", f"{en['mean']:.2f}")
+        sr = [r["stats_ratio"] for r in rows]
+        if any(abs(r["stats_abs"]) > 1e-9 for r in rows):
+            tex.macro(f"statsRatio{key}", f"{np.nanmean(sr):+.1f}")
+            tex.macro(f"statsRatioLo{key}", f"{np.nanmin(sr):+.1f}")
+            tex.macro(f"statsRatioHi{key}", f"{np.nanmax(sr):+.1f}")
+            tex.macro(f"pathRatio{key}", f"{np.nanmean([r['path_ratio'] for r in rows]):+.1f}")
+            num_json[lab]["stats_ratio"] = S.mean_ci(sr)
     for rname, runs in rules.items():
         rows = completeness_rows(runs)
         if rows:

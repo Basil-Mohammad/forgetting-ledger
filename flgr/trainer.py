@@ -342,7 +342,7 @@ class Trainer:
         model = self.model
         b1 = self.betas[0]
         end_params = flat_params(model).clone()
-        u = None
+        u, u_e = None, None
         for f in reversed(self._adam_log):
             d = torch.load(f, map_location=self.device, weights_only=False)
             L0_, G0_ = probe_grads(model, probe, d["theta"])
@@ -351,16 +351,27 @@ class Trainer:
                                             self.tol, self.max_intervals)
             w = d["D"].unsqueeze(0) * gbar
             u = (1 - b1) * w if u is None else (1 - b1) * w + b1 * u
+            if self.also_euler:                                   # left-point (idealised TracIn) adjoint
+                we = d["D"].unsqueeze(0) * G0_
+                ue = (1 - b1) * we if u_e is None else (1 - b1) * we + b1 * u_e
+                u_e = ue
             set_flat_params(model, d["theta"])
             model.train()
             terms, _, _ = self.learner.terms(model, t, d["epoch"], d["pos"].to(self.device), d["step_key"])
             uu = torch.ones(len(terms.values), device=self.device, requires_grad=True)
             grads = torch.autograd.grad((terms.values * uu).sum(), params_of(model), create_graph=True)
-            h = u @ flat(grads)
-            Dm = torch.autograd.grad(h, uu, grad_outputs=torch.eye(len(h), device=self.device), is_grads_batched=True)[0].T
+            V = torch.cat([u, u_e]) if self.also_euler else u
+            h = V @ flat(grads)
+            try:
+                Dm = torch.autograd.grad(h, uu, grad_outputs=torch.eye(len(h), device=self.device), is_grads_batched=True)[0].T
+            except RuntimeError:
+                Dm = torch.stack([torch.autograd.grad(h[i], uu, retain_graph=i < len(h) - 1)[0] for i in range(len(h))]).T
+            G = u.shape[0]
             for kind, ids, sl in zip(terms.kinds, terms.ids, terms.slices):
                 if kind == "new":
-                    acc.data.index_add_(0, ids, (-Dm[sl]).double())
+                    acc.data.index_add_(0, ids, (-Dm[sl, :G]).double())
+                    if self.also_euler:
+                        acc.data_euler.index_add_(0, ids, (-Dm[sl, G:]).double())
             os.remove(f)
         set_flat_params(model, end_params)
         self._adam_log = []

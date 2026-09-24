@@ -1,0 +1,43 @@
+# Language-model extension: continual LoRA fine-tuning of Pythia-160M (EleutherAI) used as a verbalizer
+# classifier. Task A: AG News (4 topics), task B: DBpedia (6 entity types, several semantically related to
+# the AG topics). Forgetting = loss of AG accuracy while learning DBpedia (task-incremental: each task is
+# read out over its own label words). Optimiser: Adam (= AdamW with zero weight decay, the usual LoRA
+# setting); the exact two-pass adjoint ledger of Prop. "Adam" is used. Groups = the four AG topics.
+base: _default.yaml
+benchmark: agnews_dbpedia
+setting: task
+n_tasks: 2
+data_seed: 0
+seq_len: 64
+pool_per_class: 1500
+test_per_class: 250
+probe_per_class: 12
+first_task_train_per_class: 1000        # task A: 4000 articles
+train_per_class: 400                    # task B: 2400 entries (the attributed samples)
+model:
+  name: llm
+  hf_name: EleutherAI/pythia-160m
+  lora_targets: [query_key_value]
+  lora_r: 8
+  lora_alpha: 16
+train:
+  optimizer: adam
+  lr: 5.0e-4
+  batch_size: 16
+  epochs: 2
+  first_task_epochs: 2
+ledger:
+  tracin_checkpoints: 6
+  max_intervals: 8
+scores:
+  trak_dim: 0                           # projected per-sample gradients are not available without vmap
+interventions:
+  tasks: [1]
+  reps: 3
+  removal_fracs: [0.1, 0.2]
+  removal_methods: [ledger, ledger_euler, tracin_cp10, tracin_cp3, static_tracin, loss, random]
+  lds_subsets: 8
+  param_fracs: [0.1]
+  param_scores: [ledger, fisher_delta2, random]
+  rollback: false
+  surgery_targets: 1

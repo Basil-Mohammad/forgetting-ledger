@@ -15,6 +15,14 @@ from .utils import flat, params_of, set_flat_params
 def per_sample_grads(model, x: torch.Tensor, y: torch.Tensor, mask: Optional[torch.Tensor], chunk: int = 64) -> torch.Tensor:
     """[n, P] per-sample gradients in eval mode (vmap). Use ``chunk`` to bound memory."""
     model.eval()
+    if getattr(model, "no_vmap", False):                       # e.g. HF language models: one backward per sample
+        rows = []
+        for i in range(len(x)):
+            out = model(x[i:i + 1])
+            m_ = mask[i:i + 1] if mask is not None else None
+            l = F.cross_entropy(masked_logits(out, m_), y[i:i + 1])
+            rows.append(flat(torch.autograd.grad(l, params_of(model))).detach())
+        return torch.stack(rows)
     names = [n for n, p in model.named_parameters() if p.requires_grad]
     params = {n: p.detach() for n, p in model.named_parameters() if p.requires_grad}
     buffers = {n: b for n, b in model.named_buffers()}
@@ -49,6 +57,8 @@ def grad_dot_scores(model, sc, t: int, Gm: torch.Tensor, chunk: int = 64, want_c
     """For every training sample i of task t: s[i,g] = grad l_i . G_g, optionally the cosine,
     the per-sample gradient norm and a random projection R^T grad l_i (TRAK features)."""
     x, y, mask = _task_inputs(sc, t)
+    if getattr(model, "no_vmap", False):
+        return _dots_double_backward(model, x, y, mask, Gm, chunk=int(getattr(model, "score_chunk", 16)))
     dots, coss, norms, projs = [], [], [], []
     gn = Gm.norm(dim=1).clamp_min(1e-12)
     for i in range(0, len(x), chunk):
@@ -64,6 +74,28 @@ def grad_dot_scores(model, sc, t: int, Gm: torch.Tensor, chunk: int = 64, want_c
             projs.append(g @ R)
     return (torch.cat(dots), torch.cat(coss) if want_cos else None, torch.cat(norms),
             torch.cat(projs) if R is not None else None)
+
+
+def _dots_double_backward(model, x, y, mask, Gm: torch.Tensor, chunk: int = 16):
+    """grad l_i . G_g for all i without per-sample gradients: d/du_i [G_g . grad sum_j u_j l_j] (double backward).
+    Returns (dots [N,G], None, NaN norms, None) -- cosine and projections need per-sample gradients."""
+    model.eval()
+    out = []
+    eye = torch.eye(Gm.shape[0], device=Gm.device)
+    for i in range(0, len(x), chunk):
+        xb, yb = x[i:i + chunk], y[i:i + chunk]
+        mb = mask[i:i + chunk] if mask is not None else None
+        u = torch.ones(len(yb), device=Gm.device, requires_grad=True)
+        ce = F.cross_entropy(masked_logits(model(xb), mb), yb, reduction="none")
+        grads = torch.autograd.grad((ce * u).sum(), params_of(model), create_graph=True)
+        h = Gm @ flat(grads)
+        try:
+            D = torch.autograd.grad(h, u, grad_outputs=eye, is_grads_batched=True)[0]
+        except RuntimeError:
+            D = torch.stack([torch.autograd.grad(h[k], u, retain_graph=k < len(h) - 1)[0] for k in range(len(h))])
+        out.append(D.T.detach())
+    dots = torch.cat(out)
+    return dots, None, torch.full((len(x),), float("nan"), device=dots.device), None
 
 
 def trak_harm(Psi: torch.Tensor, phi: torch.Tensor, lam_rel: float = 1e-3) -> torch.Tensor:

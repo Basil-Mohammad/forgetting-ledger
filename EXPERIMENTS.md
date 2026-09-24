@@ -222,3 +222,17 @@ the full set of removal baselines (incl. TracIn-CP 10, gradient cosine, loss, fe
 ledger), LDS with 16 subsets and three surgery targets. Hypotheses as for the core benchmarks (H1-H3, H9,
 H10); additionally H13: the statistics channel is non-negligible (> 5 % of |ΔL|) under BatchNorm and
 the ledger remains complete (ε < 5 %).
+
+**2026-09-24 (planned before any language-model result exists).** Language-model extension
+(`configs/llm_pythia.yaml`): Pythia-160M with LoRA adapters (r = 8, alpha = 16, on the fused attention
+projection), used as a verbalizer classifier; task A = AG News (4 topics, 4000 articles), task B = DBpedia
+(6 entity types, 2400 entries, several semantically related to the AG topics); prompts of 64 tokens; Adam
+(lr 5e-4, batch 16, 2 epochs per task; AdamW with zero weight decay) with the exact two-pass adjoint ledger;
+groups = the four AG topics; ten seeds. Interventions as for the core benchmarks, reduced for GPU cost
+(removal q in {10, 20} %, surgery with one target class, LDS with 8 subsets, freeze 10 % of LoRA units).
+TRAK-style projection and gradient cosine are omitted (they need explicit per-sample gradients; all
+per-sample inner products are computed by double backward). Hypotheses: H1b, H2, H9, H10 and H6 as for
+the vision benchmarks. Larger models (Pythia-410M, Qwen2.5-0.5B) were considered and rejected for cost:
+the full intervention protocol would need > 30 GPU-hours on a T4.
+Completeness check: the Split CIFAR-10 CNN runs are re-tracked on a GPU with up to 16 quadrature
+sub-intervals (`tag=n16`, tracked run only; interventions unchanged).

@@ -73,6 +73,13 @@ Configurations used in the paper (all CPU, 10 seeds each):
 | `ppm_dose.yaml` | Permuted MNIST with a fraction `perm_frac` of pixels permuted | MLP 784-100-100 | dose-response, Adam |
 | `sm3_mlp.yaml` | Split MNIST, 3 tasks, class-IL | MLP 784-256-256 | five continual learners |
 
+GPU extensions (notebooks in `notebooks/`, Colab and Kaggle):
+
+| config | scenario | model | role |
+|---|---|---|---|
+| `c10_resnet_bn.yaml` | Split CIFAR-10, 2 tasks, task-IL | reduced ResNet-18 with BatchNorm (1.1 M) | scale, statistics channel |
+| `llm_pythia.yaml` | AG News → DBpedia, verbalizer classification | Pythia-160M + LoRA (r = 8), Adam | language models |
+
 Further configurations for GPU runs: `pm5_mlp.yaml`, `sm5_mlp.yaml`, `sc10_resnet.yaml`,
 `sc100_resnet.yaml` (reduced ResNet-18 with GN or BN).
 

@@ -107,6 +107,9 @@ def build_model(cfg: dict, scenario) -> nn.Module:
     if m["name"] == "cnn":
         cifar = scenario.dataset.startswith("cifar")
         return SmallCNN(scenario.n_outputs, 3 if cifar else 1, 32 if cifar else 28, int(m.get("width", 32)), m.get("norm", "none"))
+    if m["name"] == "llm":
+        from .llm import LLMClassifier
+        return LLMClassifier(cfg, scenario)
     if m["name"] == "resnet18r":
         return ResNet18Reduced(scenario.n_outputs, nf=int(m.get("nf", 20)), norm=m.get("norm", "gn"))
     raise ValueError(m["name"])
