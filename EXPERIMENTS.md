@@ -277,3 +277,19 @@ sub-intervals at lr 5e-4 and at lr 2e-4. The per-step evaluation counts (step_ne
 steps are now logged. The LLM configuration for the final runs is fixed from this diagnostic alone, before any
 intervention result of the new runs is seen; the ten first-run seeds are not reported.
 Also fixed: resuming a GPU job failed because the RNG state was restored as a CUDA tensor.
+
+Diagnostic result (Kaggle, 2026-09-25; tracked training only, no intervention was run):
+
+| seed | lr | cap | completeness | vs. path variation | evals/step | steps at cap | forgetting | time |
+|---|---|---|---|---|---|---|---|---|
+| 2 | 5e-4 | 64 | 7.45 % | 0.16 % | 6.6 | 3 % | 3.5 pp | 72 min |
+| 7 | 5e-4 | 64 | 27.85 % | 1.64 % | 38.3 | 46 % | 29.2 pp | 345 min |
+| 2 | 2e-4 | 64 | 0.43 % | 0.10 % | 3.2 | 0 % | 11.9 pp | 41 min |
+| 7 | 2e-4 | 64 | 4.11 % | 0.31 % | 4.2 | 0 % | 0.5 pp | 50 min |
+
+At lr 5e-4 the Adam steps are too irregular for the quadrature even with 64 sub-intervals (and seed 7 needs almost
+six hours). At lr 2e-4 no step reaches the cap; the remaining residual of seed 7 is the accumulated per-step
+tolerance (300 steps x tol 1e-3, against a net change of only 0.5 pp of forgetting). Final LLM configuration:
+lr 2e-4, max_intervals 64, tol 1e-4 (configs/llm_pythia.yaml). Ten seeds are run with `all`; seeds 0-5 on Kaggle
+and 6-9 on Colab (notebooks/kaggle_llm.ipynb, notebooks/colab_llm.ipynb). Forgetting at lr 2e-4 varies strongly
+between seeds; all ten seeds are reported whatever their forgetting.

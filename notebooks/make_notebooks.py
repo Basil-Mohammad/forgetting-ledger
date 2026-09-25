@@ -23,14 +23,16 @@ EXPERIMENTS = {
         pip="",
     ),
     "llm": dict(
-        title="Language model (Pythia-160M + LoRA, AG News -> DBpedia) and CIFAR-10 CNN completeness",
-        jobs=('JOBS = [f"all configs/llm_pythia.yaml seed={s}" for s in range(10)]\n'
-              'JOBS += [f"train configs/c10_cnn.yaml seed={s} ledger.max_intervals=16 tag=n16" for s in range(10)]'),
-        hours="about 50-60 min per language-model seed and 5-10 min per CNN run on a T4",
+        title="Language model (Pythia-160M + LoRA, AG News -> DBpedia)",
+        # the ten seeds are split across the two free platforms: Kaggle (two T4) runs 0-5, Colab (one T4) runs 6-9
+        jobs={"kaggle": 'JOBS = [f"all configs/llm_pythia.yaml seed={s}" for s in range(0, 6)]',
+              "colab": 'JOBS = [f"all configs/llm_pythia.yaml seed={s}" for s in range(6, 10)]'},
+        hours="about 2-2.5 h per seed on one T4 (Kaggle: seeds 0-5, about 7-8 h; Colab: seeds 6-9, about 9-10 h)",
         smoke=["all", "configs/llm_pythia.yaml", "seed=99", "first_task_train_per_class=40", "train_per_class=24",
                "test_per_class=20", "probe_per_class=4", "ledger.tracin_checkpoints=3", "interventions.reps=1",
                "interventions.removal_fracs=[0.1]", "interventions.lds_subsets=2", "interventions.surgery_targets=1"],
         pip="transformers datasets",
+        job_timeout_h=5.0,
     ),
     "llmdiag": dict(
         title="Language model: quadrature diagnostic (tracked training only, seeds 7 and 2)",
@@ -204,7 +206,8 @@ def _cells(exp, platform):
     if exp.startswith("llm"):
         c.append(nbf.v4.new_code_cell(PREFETCH))
     c.append(nbf.v4.new_code_cell(SMOKE.format(smoke=repr(E["smoke"]))))
-    c.append(nbf.v4.new_code_cell(JOBS.format(jobs=E["jobs"])))
+    jobs = E["jobs"][platform] if isinstance(E["jobs"], dict) else E["jobs"]
+    c.append(nbf.v4.new_code_cell(JOBS.format(jobs=jobs)))
     c.append(nbf.v4.new_code_cell(RUNNER.format(job_timeout_h=E.get("job_timeout_h", 3.0))))
     c.append(nbf.v4.new_code_cell(PROGRESS))
     c.append(nbf.v4.new_code_cell(EXPORT.format(name=exp)))

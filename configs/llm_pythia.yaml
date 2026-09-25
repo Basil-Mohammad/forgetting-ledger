@@ -22,13 +22,14 @@ model:
   lora_alpha: 16
 train:
   optimizer: adam
-  lr: 5.0e-4
+  lr: 2.0e-4                            # fixed by the quadrature diagnostic (EXPERIMENTS.md); 5e-4 gave unstable steps
   batch_size: 16
   epochs: 2
   first_task_epochs: 2
 ledger:
   tracin_checkpoints: 6
-  max_intervals: 8
+  max_intervals: 64                     # adaptive: only hard steps use many sub-intervals
+  tol: 1.0e-4                           # 300 Adam steps with a small net change: tighter per-step tolerance
 scores:
   trak_dim: 0                           # projected per-sample gradients are not available without vmap
 interventions:
