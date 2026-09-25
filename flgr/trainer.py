@@ -230,7 +230,11 @@ class Trainer:
             atomic_json(ev, self.p("eval", f"task{t}.json"))
             append_jsonl({"task": t, "task_acc": ev["task_acc"], "time_s": time.time() - t0,
                           "completeness": self._completeness(acc) if acc is not None else None,
-                          "completeness_tv": self._completeness_tv(acc) if acc is not None else None}, self.p("metrics.jsonl"))
+                          "completeness_tv": self._completeness_tv(acc) if acc is not None else None,
+                          "evals_per_step": acc.n_evals / max(1, acc.steps) if acc is not None else None,
+                          "capped_frac": (sum(n >= self.max_intervals - 1 for n in acc.step_nev) / max(1, len(acc.step_nev))
+                                          if acc is not None and self.rule == "adaptive" else None)},
+                         self.p("metrics.jsonl"))
             if acc is not None:
                 d = acc.state_dict()
                 d["unit_meta"] = acc.unit_meta
@@ -321,6 +325,7 @@ class Trainer:
         dL = L_end - L_cur
         gbar, n_ev = path_average_gradient(model, probe, theta, delta, G_cur, G_end, dL, self.rule, self.tol, self.max_intervals)
         acc.n_evals += n_ev + 1
+        acc.step_nev.append(int(n_ev))
         acc.path_var += dL.abs().double()
         pg = gbar * delta.unsqueeze(0)
         acc.param += pg.sum(0).double()

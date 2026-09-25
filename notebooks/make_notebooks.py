@@ -32,6 +32,18 @@ EXPERIMENTS = {
                "interventions.removal_fracs=[0.1]", "interventions.lds_subsets=2", "interventions.surgery_targets=1"],
         pip="transformers datasets",
     ),
+    "llmdiag": dict(
+        title="Language model: quadrature diagnostic (tracked training only, seeds 7 and 2)",
+        jobs=('JOBS = []\n'
+              'for s in (7, 2):\n'
+              '    JOBS += [f"train configs/llm_pythia.yaml seed={s} ledger.max_intervals=64 tag=q64",\n'
+              '             f"train configs/llm_pythia.yaml seed={s} ledger.max_intervals=64 train.lr=0.0002 tag=q64lr2"]'),
+        hours="about 3-4 h in total (four tracked runs, two at a time)",
+        smoke=["train", "configs/llm_pythia.yaml", "seed=99", "first_task_train_per_class=40", "train_per_class=24",
+               "test_per_class=20", "probe_per_class=4", "ledger.max_intervals=64"],
+        pip="transformers datasets",
+        job_timeout_h=6.0,
+    ),
 }
 
 SETUP_REPO = '''import os, subprocess
@@ -75,7 +87,7 @@ RUNNER = '''# Runs the jobs, one per GPU in parallel (Kaggle "T4 x2": two at a t
 import subprocess, sys, time, os, threading, queue, torch
 LOGS = f"{{RUN_ROOT}}/../logs"; os.makedirs(LOGS, exist_ok=True)
 NGPU = max(1, torch.cuda.device_count())
-JOB_TIMEOUT_H = 3.0          # a job that runs longer than this is stopped (it resumes when the cell is re-run)
+JOB_TIMEOUT_H = {job_timeout_h}         # a job that runs longer than this is stopped (it resumes when the cell is re-run)
 q = queue.Queue()
 for j in JOBS:
     q.put(j)
@@ -117,7 +129,9 @@ for d in sorted(glob.glob(f"{RUN_ROOT}/*-s*")):
     if t1:
         a0 = [x for x in m if x.get("task") == 0][0]["task_acc"][0]
         print(os.path.basename(d), f"| forgetting {100 * (a0 - t1[0]['task_acc'][0]):.1f} pp",
-              f"| completeness {100 * (t1[0]['completeness'] or 0):.2f} %", "| interventions:", [s.split('_')[0] for s in steps])
+              f"| completeness {100 * (t1[0]['completeness'] or 0):.2f} % (tv {100 * (t1[0]['completeness_tv'] or 0):.2f} %)",
+              f"| evals/step {t1[0].get('evals_per_step') or 0:.1f} capped {100 * (t1[0].get('capped_frac') or 0):.0f} %",
+              "| interventions:", [s.split('_')[0] for s in steps])
     else:
         print(os.path.basename(d), "| tracked run not finished yet")'''
 
@@ -181,17 +195,17 @@ def _cells(exp, platform):
             "RUN_ROOT, DATA_ROOT, REPO_DIR = '/kaggle/working/runs', '/kaggle/tmp/data', '/kaggle/tmp/forgetting-ledger'\n"
             "LIMIT_H = 11.0   # Kaggle's hard limit is 12 h: no new job is started after 11 h\n"
             "os.makedirs(RUN_ROOT, exist_ok=True)\n"
-            "for prev in glob.glob('/kaggle/input/*/runs'):\n"
+            "for prev in glob.glob('/kaggle/input/**/runs', recursive=True):\n"
             "    print('restoring', prev)\n"
             "    shutil.copytree(prev, RUN_ROOT, dirs_exist_ok=True)"))
         token = ("try:\n    from kaggle_secrets import UserSecretsClient\n    tok = UserSecretsClient().get_secret('GH_TOKEN')\n"
                  "except Exception:\n    tok = None   # public repository: no token needed")
     c.append(nbf.v4.new_code_cell(SETUP_REPO.format(token=token, repo=REPO, url=URL, extra=extra)))
-    if exp == "llm":
+    if exp.startswith("llm"):
         c.append(nbf.v4.new_code_cell(PREFETCH))
     c.append(nbf.v4.new_code_cell(SMOKE.format(smoke=repr(E["smoke"]))))
     c.append(nbf.v4.new_code_cell(JOBS.format(jobs=E["jobs"])))
-    c.append(nbf.v4.new_code_cell(RUNNER.format()))
+    c.append(nbf.v4.new_code_cell(RUNNER.format(job_timeout_h=E.get("job_timeout_h", 3.0))))
     c.append(nbf.v4.new_code_cell(PROGRESS))
     c.append(nbf.v4.new_code_cell(EXPORT.format(name=exp)))
     nb = nbf.v4.new_notebook()

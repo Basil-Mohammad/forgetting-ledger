@@ -267,3 +267,13 @@ regime in which any single-run attribution can be counterfactually valid.
 *RQ13 reporting decision (2026-09-24).* The counterfactual-validity study (RQ13) is reported as a separate,
 follow-up study and not in the main paper; its data, code (`cf`, `scripts/sensitivity.py`) and analysis
 (`python -m flgr.analysis.paper --cf`) are part of this repository.
+
+### LLM extension: quadrature diagnostic (added after the first Kaggle run)
+The first ten Pythia-160M runs (lr 5e-4, at most 8 Simpson sub-intervals per step) left a ledger residual of
+13-115 % of the realised change (0.2 % for the Adam MLP). The residual is concentrated in a few steps with large
+loss jumps, and in the worst seed almost every step reached the sub-interval cap. Before any LLM number is used, a
+diagnostic (notebooks/kaggle_llmdiag.ipynb; seeds 7 and 2, tracked training only) compares a cap of 64
+sub-intervals at lr 5e-4 and at lr 2e-4. The per-step evaluation counts (step_nev) and the fraction of capped
+steps are now logged. The LLM configuration for the final runs is fixed from this diagnostic alone, before any
+intervention result of the new runs is seen; the ten first-run seeds are not reported.
+Also fixed: resuming a GPU job failed because the RNG state was restored as a CUDA tensor.

@@ -128,6 +128,7 @@ class LedgerAccumulator:
         self.n_evals = 0                       # probe-gradient evaluations (cost)
         self.path_var = z(G)                   # sum_t |L_g(t+1) - L_g(t)|  (total variation of the path)
         self.step_err: List[float] = []
+        self.step_nev: List[int] = []            # quadrature evaluations per step (== max_intervals - 1: capped)
         self.early: Dict[str, torch.Tensor] = {}
         self.data_euler = z(n_new, G)          # optional: per-sample Euler (idealised TracIn) attribution
         self.sample_loss: List[torch.Tensor] = []   # per-epoch per-sample training loss (anatomy analysis)
@@ -201,6 +202,7 @@ def ledger_step(model, lr: float, terms: Terms, grads_graph: List[torch.Tensor],
     dL_exact = (L_end - L_start) if L_start is not None else torch.zeros_like(L_end)
     gbar, n_ev = path_average_gradient(model, probe, theta, delta, G_start, G_end, dL_exact, rule, tol, max_intervals)
     acc.n_evals += n_ev + 1
+    acc.step_nev.append(int(n_ev))
     if shapley is not None:
         # path at the old statistics, and the symmetric statistics term
         L_end0, G_end0 = probe_grads(model, probe, theta + delta, shapley["buffers_old"])

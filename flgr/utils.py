@@ -32,9 +32,14 @@ def rng_state() -> dict:
 def set_rng_state(st: dict) -> None:
     random.setstate(st["py"])
     np.random.set_state(st["np"])
-    torch.set_rng_state(st["torch"])
+    # states are loaded with map_location=<device>; the RNG setters require CPU ByteTensors
+    torch.set_rng_state(st["torch"].cpu())
     if "cuda" in st and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(st["cuda"])
+        cuda = [s.cpu() for s in st["cuda"]]
+        if len(cuda) == torch.cuda.device_count():          # a resumed job may see a different number of GPUs
+            torch.cuda.set_rng_state_all(cuda)
+        else:
+            torch.cuda.set_rng_state(cuda[0])
 
 
 # ----------------------------------------------------------------------------- stateless hash RNG
